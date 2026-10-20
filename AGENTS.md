@@ -12,6 +12,7 @@ This project is a standalone Windows MCP server for Igor Pro. The server communi
 
 - Route live Igor work through a connected `igor-pro` MCP server. Use `ensure_igor` to attach or start; never launch Igor from a shell.
 - Prefer direct `execute_igor` commands for simple one-off work. Use IPF procedures for ODEs, instrument control, repeated loops, substantial multi-dataset work, or reusable routines.
+- For elementary work, use the supplied initialize guidance and current Igor context directly. Do not enumerate or pre-read basic-reference pages as a preflight; use `query_igor_help` for uncertain syntax, unfamiliar operations, or unresolved diagnostics. Search session memory only for nontrivial workflows being repeated or relevant workarounds, not elementary one-offs.
 - Preserve experiment data. Use fresh folders and names; do not use overwrite flags unless explicitly requested.
 - Review command results and diagnostics before retrying. A timeout can leave the outcome unknown. Inspect dialogs or compiler errors before using a dismissal tool.
 - Do not create live Igor calls as part of ordinary tests. If a live test is explicitly requested, bound writes to a uniquely named data folder.

@@ -40,7 +40,7 @@ When starting a new Igor process, the server requests that its main window be sh
 
 ## Knowledge and the optional skill
 
-The server sends a compact operational Igor core in each MCP initialization: safe data-folder and wave patterns; point indexes versus scaled coordinates; wave scaling and units; supported text import and experiment saving; routine statistics and built-in fits; simple 2-D graphs, labels, and colors; and direct-command versus procedure guidance. Use these patterns for familiar work without searching a manual page. This is prompt context sent on connection, not a promise of permanent model or host caching.
+The server sends a compact operational Igor core in each MCP initialization: safe data-folder and wave patterns; point indexes versus scaled coordinates; wave scaling and units; supported text import and experiment saving; routine statistics and built-in fits; simple 2-D graphs, labels, and colors; and direct-command versus procedure guidance. Use these patterns for familiar work without searching a manual page. Do not enumerate or pre-read basic-reference pages as a task preflight. Retrieve a specific page only when syntax is uncertain, an operation is unfamiliar, or diagnostics leave an unresolved question. This is prompt context sent on connection, not a promise of permanent model or host caching.
 
 The downloaded reference bundle is organized by task. Its broad foundation spans Igor Basics, Data, Graphing, Analysis, User Interface, and Programming, including common wave, import/export, experiment-file, graph, statistics, fitting, and routine command topics. These pages are searchable and readable on demand; the server does not preload whole pages into its initialize instructions. The `knowledge_tier` field distinguishes common `core-reference` pages from other `on-demand` references, but both tiers require a knowledge-tool call to retrieve page content. Specialized command details, extensions, instrument and XOP workflows, ODEs, Gizmo, and advanced or multidimensional plotting remain reference lookups when needed.
 
@@ -58,7 +58,7 @@ The optional [igor-pro skill](.agents/skills/igor-pro/SKILL.md) adds task routin
 
 ## Session memory and privacy
 
-MCP tool calls are recorded automatically as bounded JSONL observations. Use `search_session_memory` and `read_session_memory` to find task-specific prior work; `capture_session` writes a separate concise summary when a result or workaround should persist. Session data defaults to `%LOCALAPPDATA%\igor-mcp\sessions`; set `IGOR_SESSION_DIR` to use another location. The setup script leaves this setting out so the server uses its private per-user default.
+MCP tool calls are recorded automatically as bounded JSONL observations. Search and read prior session memory when repeating a nontrivial workflow or when the current task may depend on a relevant result or workaround; skip elementary one-off commands. `capture_session` writes a separate concise summary when a result or workaround should persist. Session data defaults to `%LOCALAPPDATA%\igor-mcp\sessions`; set `IGOR_SESSION_DIR` to use another location. The setup script leaves this setting out so the server uses its private per-user default.
 
 Logs omit bulk wave arrays and redact values under fields named like secrets, but command text and results can still contain sensitive information. Keep session files private. They are not committed automatically, are append-only, and are not deleted when the configured storage cap is reached.
 
