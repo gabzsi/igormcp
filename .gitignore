@@ -29,7 +29,6 @@ Desktop.ini
 # Local Igor call logs and session summaries
 /sessions/
 /.local/
-/.local/
 
 # Local credentials and user-specific host routing
 .env

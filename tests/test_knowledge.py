@@ -51,6 +51,7 @@ class PublicKnowledgeBundleTests(unittest.TestCase):
             guide_result["results"][0]["document_id"],
             "guides/Igor-Pro-Gotchas-and-Pitfalls.md",
         )
+        self.assertEqual(guide_result["results"][0]["knowledge_tier"], "on-demand")
 
         manual_result = knowledge.search("CurveFit", collection="manuals", max_results=3)
         self.assertIsNone(manual_result["error"])
@@ -65,6 +66,7 @@ class PublicKnowledgeBundleTests(unittest.TestCase):
             result["document_id"], "guides/Igor-Pro-Gotchas-and-Pitfalls.md"
         )
         self.assertEqual(len(result["content"]), 500)
+        self.assertEqual(result["knowledge_tier"], "on-demand")
         self.assertTrue(result["truncated"])
         json.dumps(result)
 
@@ -128,6 +130,7 @@ class PublicKnowledgeBundleTests(unittest.TestCase):
                         "path": "manuals/External Fixture.md",
                         "collection": "manuals",
                         "title": "External Fixture",
+                        "knowledge_tier": "core-reference",
                         "bundle_sha256": digest,
                     }
                 ]
@@ -141,7 +144,9 @@ class PublicKnowledgeBundleTests(unittest.TestCase):
                 "r=k.search('external-bundle-fixture-token', collection='manuals'); "
                 "assert r['results_count']==1, r; "
                 "d=k.read_document(r['results'][0]['document_id']); "
-                "print(json.dumps({'id':d['document_id'],'content':d['content']}))"
+                "print(json.dumps({'id':d['document_id'],'content':d['content'],"
+                "'search_tier':r['results'][0]['knowledge_tier'],"
+                "'read_tier':d['knowledge_tier']}))"
             )
             environment = os.environ.copy()
             environment["IGOR_KNOWLEDGE_DIR"] = str(bundle)
@@ -158,6 +163,8 @@ class PublicKnowledgeBundleTests(unittest.TestCase):
             loaded = json.loads(result.stdout)
             self.assertEqual(loaded["id"], "manuals/External Fixture.md")
             self.assertIn("external-bundle-fixture-token", loaded["content"])
+            self.assertEqual(loaded["search_tier"], "core-reference")
+            self.assertEqual(loaded["read_tier"], "core-reference")
 
 
 if __name__ == "__main__":

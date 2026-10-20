@@ -28,6 +28,7 @@ _MAX_RESULTS = 20
 _DEFAULT_MAX_CHARS = 20_000
 _MAX_READ_CHARS = 200_000
 _MAX_EXCERPT_CHARS = 700
+_KNOWLEDGE_TIERS = frozenset({"core-reference", "on-demand"})
 _HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*#*\s*$")
 _COMMAND_RE = re.compile(
     r"^[A-Za-z_][A-Za-z0-9_]*(?:/[A-Za-z0-9_.,=+*?()/-]+)?$"
@@ -53,6 +54,13 @@ _DOCUMENTS = tuple(
     and isinstance(document.get("path"), str)
 )
 _DOCUMENT_BY_ID = {document["id"]: document for document in _DOCUMENTS}
+
+
+def _knowledge_tier(document: dict[str, Any]) -> str:
+    """Return a recognized reference tier, defaulting older bundles to on-demand."""
+
+    value = document.get("knowledge_tier")
+    return value if isinstance(value, str) and value in _KNOWLEDGE_TIERS else "on-demand"
 
 
 def _clean_query(value: object, label: str) -> str:
@@ -302,6 +310,7 @@ def search(
                 {
                     "document_id": document_id,
                     "collection": document.get("collection"),
+                    "knowledge_tier": _knowledge_tier(document),
                     "file": Path(str(document["path"])).stem,
                     "title": title,
                     "section": heading or title,
@@ -371,6 +380,7 @@ def read_document(
     return {
         "document_id": document_id,
         "collection": document.get("collection"),
+        "knowledge_tier": _knowledge_tier(document),
         "title": _document_title(document, text),
         "content": content,
         "truncated": offset > 0 or end_offset < len(text),

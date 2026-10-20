@@ -12,7 +12,9 @@ Set-Location igormcp
 .\setup.ps1
 ```
 
-The setup script creates `.venv`, installs this package and its dependencies, and writes two path-resolved configuration examples under `.local/`. It does not edit your MCP host configuration or start Igor. Copy the matching entry from `.local/mcp-config.codex.toml` or `.local/mcp-config.example.json` into your host's configuration, then restart or reconnect the host. `.local/` is ignored by Git. If setup cannot find Python, pass `-Python` with the path to a Python 3.10+ executable.
+The setup script creates `.venv`, installs this package and its dependencies, downloads and validates the official Markdown pages listed by WaveMetrics' documentation index, and writes two path-resolved configuration examples under `.local/`. The download requires internet access. The downloaded pages stay in the Git-ignored `.local/knowledge/`; they are not included in this repository or its package. If an existing `.local/knowledge/` bundle is present, updates retain compatible manual documents that are no longer in the current online index. Use `-IncludeExistingKnowledge 'D:\path\to\knowledge'` to merge another validated local bundle during setup. If setup cannot find Python, pass `-Python` with the path to a Python 3.10+ executable.
+
+Setup does not edit your MCP host configuration or start Igor. Copy the matching entry from `.local/mcp-config.codex.toml` or `.local/mcp-config.example.json` into your host's configuration, then restart or reconnect the host. A successful download activates the validated local bundle. If refresh fails but a previously validated local or explicitly supplied bundle exists, setup warns that it is using that older bundle. If no complete bundle is available, setup stops without writing MCP config files; retry with the command shown by setup. To skip the network download, use `.\setup.ps1 -SkipKnowledgeDownload` only when a valid local bundle already exists or pass one with `-IncludeExistingKnowledge`.
 
 When the MCP server is connected, call `ensure_igor` to attach to or start Igor. This is the only startup step; do not launch Igor from a shell. To verify the code without Igor, run the offline suite:
 
@@ -38,7 +40,17 @@ When starting a new Igor process, the server requests that its main window be sh
 
 ## Knowledge and the optional skill
 
-The server's initialize instructions include compact everyday Igor guidance for waves, scaling, calculations, folders, plotting, axis labels, and colors. The public package includes eight curated project guides. It does not include WaveMetrics manuals or extracted manual images because no redistribution grant is included. Therefore `query_igor_help` has no manual results unless `IGOR_KNOWLEDGE_DIR` points to an existing compatible, authorized knowledge directory containing `manifest.json` and its referenced documents. This project does not import native Igor help files. Online references are available from [WaveMetrics' manual page](https://www.wavemetrics.com/products/igorpro/manual) and [Igor Pro documentation](https://docs.wavemetrics.com/igorpro/).
+The server's initialize instructions supply a compact everyday Igor core on each MCP connection, including routine wave creation and assignments, scaling, folders, calculations, plotting, axis labels, and colors. Use that core for familiar basics without looking up a manual page; use the reference tools when syntax is uncertain or a task is advanced or version-specific. These instructions are sent during initialization and are not a promise of permanent model or host caching.
+
+The local manual index labels selected basic pages `core-reference` and broader references `on-demand`. The label is visible in search and read results, but neither tier is loaded into the initialize instructions: documents are read only through a knowledge tool call. The repository and Python package include eight curated project guides, but no WaveMetrics manuals or extracted manual images. By default, setup downloads the Markdown pages listed by WaveMetrics' `llms.txt` documentation index into a local, ignored cache. A fresh install gets the pages in that index at download time; its coverage can change and may omit older or otherwise unlisted Igor Pro material. Subsequent updates preserve compatible non-indexed manuals already in the local bundle. This is not a claim that every Igor Pro manual, installed extension, or help topic is included. `query_igor_help` searches a validated local bundle when the generated MCP entry sets `IGOR_KNOWLEDGE_DIR`. `-SkipKnowledgeDownload` uses an existing valid bundle and stops with an error if none is available. The curated guides remain available through `search_igor_knowledge` in either case.
+
+To refresh the local cache after setup, run:
+
+```powershell
+.\.venv\Scripts\python.exe -B scripts\update_knowledge.py --output .local\knowledge
+```
+
+If no valid bundle was available when setup generated the MCP configuration, rerun `.\setup.ps1` after a successful refresh. The downloader reads the official Markdown index at [docs.wavemetrics.com/llms.txt](https://docs.wavemetrics.com/llms.txt); this project does not import native Igor help files. For product documentation and terms, see [WaveMetrics' manual page](https://www.wavemetrics.com/products/igorpro/manual) and [Igor Pro documentation](https://docs.wavemetrics.com/igorpro/).
 
 The optional [igor-pro skill](.agents/skills/igor-pro/SKILL.md) adds task routing and data-safety guidance for compatible agents. It is not required by the server and does not configure an MCP host.
 
