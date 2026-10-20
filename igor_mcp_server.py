@@ -69,11 +69,16 @@ _TMP_READ_ATTEMPTS = 10
 _TMP_READ_DELAY_SECONDS = 0.05
 _EXECUTION_STATUS_MARKER = "<<IGOR-MCP-STATUS>>"
 _WM_CLOSE = 0x0010
+_SW_HIDE = 0
 _SW_SHOWNOACTIVATE = 4
 _GW_OWNER = 4
 _GWL_EXSTYLE = -20
 _WS_EX_DLGMODALFRAME = 0x00000001
 _DIALOG_WINDOW_CLASSES = frozenset({"#32770"})
+_DDE_HELPER_WINDOW_CLASSES = frozenset(
+    {"OleDdeWndClass", "DDEMLEvent", "DDEMLMom"}
+)
+_DDE_HELPER_WINDOW_TITLES = frozenset({"dde server window"})
 _IGOR_EXECUTABLE_NAMES = frozenset({"igor.exe", "igor64.exe"})
 _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 _UI_AUTOMATION_TIMEOUT_SECONDS = 4
@@ -1131,6 +1136,7 @@ def _show_new_igor_window_without_activation(process_id: int) -> bool:
         return False
 
     windows: list[int] = []
+    helper_windows: list[int] = []
     enum_proc_type = WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
 
     @enum_proc_type
@@ -1138,11 +1144,20 @@ def _show_new_igor_window_without_activation(process_id: int) -> bool:
         hwnd = int(hwnd)
         if _window_process_id(hwnd) != process_id:
             return True
+        class_name = _window_class(hwnd)
+        if class_name in _DDE_HELPER_WINDOW_CLASSES:
+            helper_windows.append(hwnd)
+            return True
+        title = _window_text(hwnd)
+        if title.casefold() in _DDE_HELPER_WINDOW_TITLES:
+            # The title is an additional process-scoped exclusion only. Never
+            # hide a window based on its title because Igor graphs are user data.
+            return True
         if _window_owner(hwnd):
             return True
-        if _window_class(hwnd) in _DIALOG_WINDOW_CLASSES:
+        if class_name in _DIALOG_WINDOW_CLASSES:
             return True
-        if _window_text(hwnd) in _COMPILER_DIALOG_TITLES:
+        if title in _COMPILER_DIALOG_TITLES:
             return True
         windows.append(hwnd)
         return True
@@ -1152,13 +1167,19 @@ def _show_new_igor_window_without_activation(process_id: int) -> bool:
     deadline = time.monotonic() + 3.0
     while time.monotonic() < deadline:
         windows.clear()
+        helper_windows.clear()
         windll.user32.EnumWindows(top_level_callback, 0)
+        for hwnd in helper_windows:
+            if windll.user32.IsWindowVisible(hwnd):
+                windll.user32.ShowWindow(wintypes.HWND(hwnd), _SW_HIDE)
         if windows:
             break
         time.sleep(0.05)
 
     for hwnd in windows:
-        if not windll.user32.IsWindowVisible(hwnd) or windll.user32.IsIconic(hwnd):
+        # A minimized window is visible in the Win32 sense. Leave it minimized
+        # if Igor or the user chose that state during startup.
+        if not windll.user32.IsWindowVisible(hwnd):
             windll.user32.ShowWindow(wintypes.HWND(hwnd), _SW_SHOWNOACTIVATE)
 
     return bool(windows)

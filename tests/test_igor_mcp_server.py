@@ -17,6 +17,166 @@ sys.path.insert(0, str(SERVER_DIR))
 import igor_mcp_server as server
 
 
+class StartupWindowTests(unittest.TestCase):
+    def _run_window_scan(self, windows, process_id=1234):
+        by_hwnd = {window["hwnd"]: window for window in windows}
+
+        def hwnd_value(hwnd):
+            value = getattr(hwnd, "value", hwnd)
+            return int(value or 0)
+
+        class FakeUser32:
+            def __init__(self):
+                self.show_calls = []
+
+            def EnumWindows(self, callback, _lparam):
+                for window in windows:
+                    callback(window["hwnd"], 0)
+                return True
+
+            def IsWindowVisible(self, hwnd):
+                return by_hwnd[hwnd_value(hwnd)]["visible"]
+
+            def IsIconic(self, hwnd):
+                return by_hwnd[hwnd_value(hwnd)]["minimized"]
+
+            def ShowWindow(self, hwnd, command):
+                window = by_hwnd[hwnd_value(hwnd)]
+                self.show_calls.append((window["hwnd"], command))
+                if command == server._SW_HIDE:
+                    window["visible"] = False
+                elif command == server._SW_SHOWNOACTIVATE:
+                    window["visible"] = True
+                    window["minimized"] = False
+                return True
+
+        user32 = FakeUser32()
+        fake_windll = type("FakeWindll", (), {"user32": user32})()
+        with (
+            patch.object(
+                server,
+                "WINFUNCTYPE",
+                side_effect=lambda *_args: (lambda callback: callback),
+            ),
+            patch.object(server, "windll", fake_windll),
+            patch.object(
+                server,
+                "_window_process_id",
+                side_effect=lambda hwnd: by_hwnd[hwnd_value(hwnd)]["pid"],
+            ),
+            patch.object(
+                server,
+                "_window_owner",
+                side_effect=lambda hwnd: by_hwnd[hwnd_value(hwnd)]["owner"],
+            ),
+            patch.object(
+                server,
+                "_window_class",
+                side_effect=lambda hwnd: by_hwnd[hwnd_value(hwnd)]["class"],
+            ),
+            patch.object(
+                server,
+                "_window_text",
+                side_effect=lambda hwnd: by_hwnd[hwnd_value(hwnd)]["title"],
+            ),
+            patch.object(server.time, "sleep"),
+        ):
+            result = server._show_new_igor_window_without_activation(process_id)
+        return result, user32.show_calls
+
+    def test_new_process_hides_exact_dde_helpers_and_shows_hidden_main_noactivate(self):
+        windows = [
+            {
+                "hwnd": 0x100,
+                "pid": 1234,
+                "owner": 0,
+                "class": "OleDdeWndClass",
+                "title": "DDE Server Window",
+                "visible": True,
+                "minimized": False,
+            },
+            {
+                "hwnd": 0x101,
+                "pid": 1234,
+                "owner": 0,
+                "class": "DDEMLEvent",
+                "title": "",
+                "visible": True,
+                "minimized": False,
+            },
+            {
+                "hwnd": 0x102,
+                "pid": 1234,
+                "owner": 0,
+                "class": "DDEMLMom",
+                "title": "",
+                "visible": True,
+                "minimized": False,
+            },
+            {
+                "hwnd": 0x103,
+                "pid": 1234,
+                "owner": 0,
+                "class": "UnknownOleClass",
+                "title": "DDE Server Window",
+                "visible": False,
+                "minimized": False,
+            },
+            {
+                "hwnd": 0x104,
+                "pid": 1234,
+                "owner": 0,
+                "class": "IgorMainWindow",
+                "title": "Igor Pro",
+                "visible": False,
+                "minimized": False,
+            },
+            {
+                "hwnd": 0x105,
+                "pid": 5678,
+                "owner": 0,
+                "class": "OleDdeWndClass",
+                "title": "DDE Server Window",
+                "visible": True,
+                "minimized": False,
+            },
+        ]
+
+        result, calls = self._run_window_scan(windows)
+
+        self.assertTrue(result)
+        self.assertEqual(
+            calls,
+            [
+                (0x100, server._SW_HIDE),
+                (0x101, server._SW_HIDE),
+                (0x102, server._SW_HIDE),
+                (0x104, server._SW_SHOWNOACTIVATE),
+            ],
+        )
+        self.assertTrue(windows[5]["visible"], "foreign-process window must be untouched")
+
+    def test_new_process_leaves_visible_or_minimized_main_window_unchanged(self):
+        windows = [
+            {
+                "hwnd": 0x200,
+                "pid": 1234,
+                "owner": 0,
+                "class": "IgorMainWindow",
+                "title": "Igor Pro",
+                "visible": True,
+                "minimized": True,
+            }
+        ]
+
+        result, calls = self._run_window_scan(windows)
+
+        self.assertTrue(result)
+        self.assertEqual(calls, [])
+        self.assertTrue(windows[0]["visible"])
+        self.assertTrue(windows[0]["minimized"])
+
+
 class ValidationTests(unittest.TestCase):
     def test_command_limit_counts_utf8_bytes(self):
         server._validate_command("\u00e9" * 1_200)
