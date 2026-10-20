@@ -4,7 +4,7 @@ import hashlib
 import json
 import tempfile
 import unittest
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from unittest.mock import patch
 
 from scripts import update_knowledge as updater
@@ -59,19 +59,28 @@ class RewriteImagesTests(unittest.TestCase):
 
 
 class KnowledgeTierTests(unittest.TestCase):
-    def test_explicit_core_urls_and_unknown_fallback_are_deterministic(self):
-        self.assertEqual(len(updater.CORE_REFERENCE_URLS), 11)
+    def test_core_sections_and_bounded_commands_are_deterministic(self):
+        cases = {
+            "https://docs.wavemetrics.com/igorpro/igor-basics/multidimensional-waves.md": ("core-reference", "igor-basics"),
+            "https://docs.wavemetrics.com/igorpro/analysis/image-processing.md": ("core-reference", "analysis"),
+            "https://docs.wavemetrics.com/igorpro/graphing/3d-graphics.md": ("core-reference", "graphing"),
+            "https://docs.wavemetrics.com/igorpro/data/igor-hdf5-guide.md": ("core-reference", "data"),
+            "https://docs.wavemetrics.com/igorpro/user-interface/menus.md": ("core-reference", "user-interface"),
+            "https://docs.wavemetrics.com/igorpro/programming/structures/point.md": ("core-reference", "programming"),
+            "https://docs.wavemetrics.com/igorpro/commands/make.md": ("core-reference", "common-commands"),
+            "https://docs.wavemetrics.com/igorpro/commands/savepict.md": ("core-reference", "common-commands"),
+            "https://docs.wavemetrics.com/igorpro/commands/unknowncommand.md": ("on-demand", "command-catalog"),
+            "https://docs.wavemetrics.com/igorpro/extensions/igor-filter-design-laboratory.md": ("on-demand", "specialist-reference"),
+        }
+        for url, expected in cases.items():
+            with self.subTest(url=url):
+                self.assertEqual(updater.classify_knowledge_page(url), expected)
         self.assertEqual(
-            updater.classify_knowledge_tier("https://docs.wavemetrics.com/igorpro/commands/make.md"),
-            "core-reference",
-        )
-        self.assertEqual(
-            updater.classify_knowledge_tier("https://docs.wavemetrics.com/igorpro/igor-basics/waves.md"),
-            "core-reference",
-        )
-        self.assertEqual(
-            updater.classify_knowledge_tier("https://docs.wavemetrics.com/igorpro/commands/unlisted.md"),
-            "on-demand",
+            updater.classify_knowledge_page(
+                "https://docs.wavemetrics.com/igorpro/commands/local-helper.md",
+                "Igor Pro > Programming > Keywords",
+            ),
+            ("core-reference", "programming"),
         )
         self.assertEqual(updater.classify_knowledge_tier(None), "on-demand")
 
@@ -87,8 +96,10 @@ class KnowledgeTierTests(unittest.TestCase):
         updater.apply_knowledge_tiers(manifest)
         self.assertEqual([(item["id"], item["path"]) for item in docs], original_identity)
         self.assertEqual([item["knowledge_tier"] for item in docs], ["core-reference", "on-demand", "on-demand", "on-demand"])
+        self.assertEqual([item["knowledge_category"] for item in docs], ["common-commands", "command-catalog", "local-reference", "project-guide"])
         self.assertEqual(manifest["bundle"]["source_scope"]["official_online_knowledge_tier_counts"], {"core-reference": 1, "on-demand": 1})
         self.assertEqual(manifest["bundle"]["source_scope"]["all_document_knowledge_tier_counts"], {"core-reference": 1, "on-demand": 3})
+        self.assertIn("not preloaded", manifest["bundle"]["knowledge_tier_policy"])
 
     def test_offline_retier_updates_manifest_only_after_validating_bundle(self):
         make_url = "https://docs.wavemetrics.com/igorpro/commands/make.md"
@@ -135,8 +146,10 @@ class BundleUpdateTests(unittest.TestCase):
             self.assertEqual({d["id"]: d["path"] for d in manifest["documents"] if d["collection"] == "guides"}, expected_guides)
             manual = next(d for d in manifest["documents"] if d["collection"] == "manuals")
             self.assertEqual(manual["source_url"], page_url)
+            self.assertEqual(manual["id"], "manuals/online/igorpro/basics/waves.md")
             self.assertEqual(manual["source_sha256"], hashlib.sha256(source).hexdigest().upper())
             self.assertEqual(manual["knowledge_tier"], "on-demand")
+            self.assertEqual(manual["path"], "official/basics/waves.md")
             content = (output / manual["path"]).read_text(encoding="utf-8")
             self.assertIn("https://docs.wavemetrics.com/igorpro/basics/waves.png", content)
             self.assertEqual(manual["bundle_sha256"], hashlib.sha256(content.encode()).hexdigest().upper())
@@ -309,6 +322,92 @@ class BundleUpdateTests(unittest.TestCase):
             (existing / "manifest.json").write_text(json.dumps({"documents": [record]}), encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "collide"):
                 updater.merge_downloaded_bundle(downloaded, root / "merged", existing)
+
+
+class CompactLayoutTests(unittest.TestCase):
+    def test_official_url_layout_strips_only_the_redundant_igorpro_prefix(self):
+        self.assertEqual(
+            updater._official_bundle_path("https://docs.wavemetrics.com/igorpro/igor-basics/waves.md"),
+            "official/igor-basics/waves.md",
+        )
+        self.assertEqual(
+            updater._official_bundle_path("https://docs.wavemetrics.com/release-notes/10.03.md"),
+            "official/release-notes/10.03.md",
+        )
+        with self.assertRaises(ValueError):
+            updater._official_bundle_path("https://docs.wavemetrics.com/igorpro/%2e%2e/private.md")
+
+    def test_offline_restructure_preserves_ids_content_guides_and_relative_assets(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            root = Path(scratch)
+            source = root / "source"
+            old_page = "official/online/igorpro/graphing/graphs.md"
+            page_data = b"# Graphs\n![sample](./media/plot.png)\n"
+            asset_data = b"fixture image bytes"
+            page = source / Path(*PurePosixPath(old_page).parts)
+            page.parent.mkdir(parents=True)
+            (page.parent / "media").mkdir()
+            page.write_bytes(page_data)
+            (page.parent / "media" / "plot.png").write_bytes(asset_data)
+            guide_data = b"# Curated\n"
+            (source / "curated").mkdir()
+            (source / "curated" / "guide.md").write_bytes(guide_data)
+            original_id = "manuals/online/igorpro/graphing/graphs.md"
+            source_url = "https://docs.wavemetrics.com/igorpro/graphing/graphs.md"
+            manifest = {
+                "schema_version": 1,
+                "bundle": {"source_scope": {"source_index_url": updater.INDEX_URL}},
+                "documents": [
+                    {
+                        "id": original_id, "path": old_page, "collection": "manuals", "title": "Graphs",
+                        "source_url": source_url, "source_index_url": updater.INDEX_URL,
+                        "bundle_sha256": hashlib.sha256(page_data).hexdigest().upper(),
+                    },
+                    {
+                        "id": "guides/curated", "path": "curated/guide.md", "collection": "guides",
+                        "bundle_sha256": hashlib.sha256(guide_data).hexdigest().upper(),
+                    },
+                ],
+            }
+            (source / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+            output = root / "restructured"
+            remapped, _digest = updater.restructure_bundle(source, output)
+            result = json.loads((output / "manifest.json").read_text(encoding="utf-8"))
+            manual = next(record for record in result["documents"] if record["id"] == original_id)
+            self.assertEqual(remapped, 1)
+            self.assertEqual(manual["path"], "official/graphing/graphs.md")
+            self.assertEqual(manual["id"], original_id)
+            self.assertEqual(manual["bundle_sha256"], hashlib.sha256(page_data).hexdigest().upper())
+            self.assertEqual((output / manual["path"]).read_bytes(), page_data)
+            self.assertEqual((output / "official" / "graphing" / "media" / "plot.png").read_bytes(), asset_data)
+            self.assertEqual(manual["bundle_assets"][0]["path"], "official/graphing/media/plot.png")
+            self.assertEqual((output / "curated" / "guide.md").read_bytes(), guide_data)
+            self.assertTrue((source / old_page).is_file())
+
+    def test_offline_restructure_refuses_case_insensitive_path_collisions(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            root = Path(scratch)
+            source = root / "source"
+            docs = []
+            for identifier, old_path, url in (
+                ("manuals/a", "old/a.md", "https://docs.wavemetrics.com/igorpro/data/shared.md"),
+                ("manuals/b", "old/b.md", "https://docs.wavemetrics.com/data/shared.md"),
+            ):
+                data = f"# {identifier}\n".encode()
+                path = source / old_path
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(data)
+                docs.append({
+                    "id": identifier, "path": old_path, "collection": "manuals", "source_url": url,
+                    "source_index_url": updater.INDEX_URL,
+                    "bundle_sha256": hashlib.sha256(data).hexdigest().upper(),
+                })
+            (source / "manifest.json").write_text(json.dumps({"bundle": {}, "documents": docs}), encoding="utf-8")
+            output = root / "output"
+            with self.assertRaisesRegex(ValueError, "collide"):
+                updater.restructure_bundle(source, output)
+            self.assertFalse(output.exists())
+            self.assertTrue((source / "old" / "a.md").is_file())
 
 
 if __name__ == "__main__":

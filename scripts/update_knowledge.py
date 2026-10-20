@@ -10,6 +10,7 @@ import hashlib
 import html
 import json
 import os
+import posixpath
 import re
 import shutil
 import socket
@@ -28,24 +29,21 @@ from typing import Any
 
 INDEX_URL = "https://docs.wavemetrics.com/llms.txt"
 ALLOWED_HOST = "docs.wavemetrics.com"
-CORE_REFERENCE_URLS = frozenset(
+CORE_REFERENCE_GROUPS = {
+    "igor-basics": "Igor Basics",
+    "analysis": "Analysis",
+    "graphing": "Graphing and Making Figures",
+    "data": "Data and file workflows",
+    "user-interface": "User Interface",
+    "programming": "Programming foundations and reference",
+}
+CORE_COMMANDS = frozenset(
     {
-        f"https://{ALLOWED_HOST}/igorpro/commands/{name}.md"
-        for name in (
-            "make",
-            "duplicate",
-            "setscale",
-            "display",
-            "appendtograph",
-            "modifygraph",
-            "label",
-            "wavestats",
-            "curvefit",
-        )
-    }
-    | {
-        f"https://{ALLOWED_HOST}/igorpro/igor-basics/waves.md",
-        f"https://{ALLOWED_HOST}/igorpro/igor-basics/data-folders.md",
+        "make", "duplicate", "redimension", "insertpoints", "deletepoints", "concatenate",
+        "setscale", "wavestats", "newdatafolder", "setdatafolder", "getdatafolder",
+        "display", "appendtograph", "modifygraph", "label", "setaxis", "legend", "textbox",
+        "errorbars", "savepict", "curvefit", "loadwave", "savedata", "saveexperiment",
+        "smooth", "integrate", "differentiate",
     }
 )
 MAX_INDEX_BYTES = 5 * 1024 * 1024
@@ -65,13 +63,144 @@ _IMAGE_RE = re.compile(
 _HTML_IMAGE_RE = re.compile(r"(?P<prefix><img\b[^>]*?\bsrc\s*=\s*)(?P<q>['\"])(?P<url>.*?)(?P=q)", re.I)
 
 
-def classify_knowledge_tier(source_url: str | None) -> str:
-    """Classify only the explicit small core-reference URL allowlist."""
-    return "core-reference" if source_url in CORE_REFERENCE_URLS else "on-demand"
+def _source_path_parts(source_url: str | None) -> tuple[str, ...]:
+    if not isinstance(source_url, str) or not source_url:
+        return ()
+    try:
+        parsed = _safe_url(source_url)
+    except ValueError:
+        return ()
+    parts = tuple(urllib.parse.unquote(part) for part in parsed.path.split("/")[1:])
+    if any(
+        part in {"", ".", ".."} or "/" in part or "\\" in part or ":" in part or "\x00" in part
+        for part in parts
+    ):
+        return ()
+    return parts
+
+
+def _official_bundle_path(source_url: str) -> str:
+    """Map an indexed URL to the compact official/<section>/... layout."""
+    parts = _source_path_parts(source_url)
+    if not parts or not parts[-1].casefold().endswith(".md"):
+        raise ValueError(f"Official source URL is not an indexed Markdown page: {source_url}")
+    if parts[0].casefold() == "igorpro":
+        parts = parts[1:]
+    if not parts:
+        raise ValueError(f"Official source URL has no page path: {source_url}")
+    relative = PurePosixPath("official", *parts).as_posix()
+    if relative.casefold().startswith("official/online/"):
+        raise AssertionError("Redundant online prefix remained in official bundle path")
+    return relative
+
+
+def _mapped_bundle_asset_path(old_document_path: str, new_document_path: str, old_asset_path: str) -> str:
+    """Keep an asset's document-relative location when its Markdown page moves."""
+    old_parent = PurePosixPath(old_document_path).parent.as_posix()
+    new_parent = PurePosixPath(new_document_path).parent.as_posix()
+    asset_relative = posixpath.relpath(old_asset_path, start=old_parent)
+    mapped = posixpath.normpath(posixpath.join(new_parent, asset_relative))
+    if mapped in {"", ".", ".."} or mapped.startswith("../") or mapped.startswith("/") or "\\" in mapped:
+        raise ValueError(f"Moving {old_document_path} would put a relative asset outside the bundle: {old_asset_path}")
+    return mapped
+
+
+def _copy_document_assets(
+    source_root: Path,
+    stage: Path,
+    original_record: dict[str, Any],
+    new_document_path: str,
+    document_bytes: bytes,
+    occupied: dict[str, str],
+) -> list[dict[str, Any]]:
+    """Copy declared and linked local assets, preserving relative image URLs."""
+    old_document_path = original_record["path"]
+    moved = old_document_path != new_document_path
+    asset_records: dict[str, dict[str, Any]] = {}
+
+    def copy_one(old_asset_path: str) -> dict[str, Any]:
+        source_asset = _safe_relative(source_root, old_asset_path)
+        if not source_asset.is_file():
+            raise ValueError(f"Document asset is missing: {original_record['id']} ({old_asset_path})")
+        data = source_asset.read_bytes()
+        new_asset_path = (
+            _mapped_bundle_asset_path(old_document_path, new_document_path, old_asset_path)
+            if moved
+            else old_asset_path
+        )
+        digest = _copy_preserved_file(stage, new_asset_path, data, occupied)
+        return {"path": new_asset_path, "bundle_sha256": digest, "bundle_bytes": len(data)}
+
+    for item in original_record.get("bundle_assets", []):
+        if not isinstance(item, dict) or not isinstance(item.get("path"), str):
+            raise ValueError(f"Invalid asset metadata in {original_record['id']}")
+        copied = copy_one(item["path"])
+        asset_records[copied["path"].casefold()] = copied
+
+    if original_record.get("collection") == "manuals":
+        text = document_bytes.decode("utf-8", errors="strict")
+        old_parent = PurePosixPath(old_document_path).parent.as_posix()
+        for raw_url in _image_urls(text):
+            parsed = urllib.parse.urlsplit(raw_url)
+            if parsed.scheme or parsed.netloc or not parsed.path:
+                continue
+            image_relative = urllib.parse.unquote(parsed.path)
+            if image_relative.startswith(("/", "\\")) or "\\" in image_relative:
+                raise ValueError(f"Unsafe local image path in {original_record['id']}: {raw_url}")
+            old_asset_path = posixpath.normpath(posixpath.join(old_parent, image_relative))
+            if old_asset_path in {"", ".", ".."} or old_asset_path.startswith("../"):
+                raise ValueError(f"Local image escapes the source bundle in {original_record['id']}: {raw_url}")
+            copied = copy_one(old_asset_path)
+            asset_records[copied["path"].casefold()] = copied
+    return list(asset_records.values())
+
+
+def classify_knowledge_page(
+    source_url: str | None, source_group: str | None = None
+) -> tuple[str, str]:
+    """Return retrieval tier and task category for an official page.
+
+    Major everyday reference sections are broadly available. The very large
+    command catalog stays on-demand except for commands used in routine wave,
+    data, analysis, and graph workflows. This metadata never preloads a manual.
+    """
+    category = "specialist-reference"
+    if source_group:
+        sections = [part.strip().casefold() for part in source_group.split(">")]
+        aliases = {
+            "igor basics": "igor-basics",
+            "analysis": "analysis",
+            "graphing": "graphing",
+            "making figures": "graphing",
+            "data": "data",
+            "user interface": "user-interface",
+            "programming": "programming",
+        }
+        for section in sections:
+            matched = aliases.get(section)
+            if matched:
+                category = matched
+                break
+    if category == "specialist-reference":
+        parts = _source_path_parts(source_url)
+        if parts and parts[0].casefold() == "igorpro" and len(parts) >= 2:
+            section = parts[1].casefold()
+            if section in CORE_REFERENCE_GROUPS:
+                category = section
+            elif section == "commands" and len(parts) == 3 and parts[2].casefold().endswith(".md"):
+                command = parts[2][:-3].casefold()
+                category = "common-commands" if command in CORE_COMMANDS else "command-catalog"
+    tier = "core-reference" if category in CORE_REFERENCE_GROUPS or category == "common-commands" else "on-demand"
+    return tier, category
+
+
+def classify_knowledge_tier(source_url: str | None, source_group: str | None = None) -> str:
+    """Return the retrieval tier; unknown and specialist pages default on-demand."""
+    return classify_knowledge_page(source_url, source_group)[0]
 
 
 def apply_knowledge_tiers(manifest: dict[str, Any]) -> dict[str, Any]:
-    """Add deterministic retrieval-tier metadata without changing document IDs or paths."""
+    """Add deterministic retrieval metadata without changing IDs, paths, or content."""
     documents = manifest.get("documents")
     if not isinstance(documents, list):
         raise ValueError("Knowledge manifest has no documents list")
@@ -81,18 +210,40 @@ def apply_knowledge_tiers(manifest: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(document, dict):
             raise ValueError("Knowledge manifest contains an invalid document record")
         if document.get("collection") == "manuals" and document.get("source_url"):
-            tier = classify_knowledge_tier(str(document["source_url"]))
+            tier, category = classify_knowledge_page(
+                str(document["source_url"]), document.get("source_index_group")
+            )
             online_counts[tier] += 1
         else:
             tier = "on-demand"
+            category = "project-guide" if document.get("collection") == "guides" else "local-reference"
         document["knowledge_tier"] = tier
+        document["knowledge_category"] = category
         total_counts[tier] += 1
     bundle = manifest.setdefault("bundle", {})
     bundle["knowledge_tier_policy"] = (
-        "Only pages in the explicit core-reference allowlist are labeled core-reference; "
-        "all other official pages default to on-demand. The compact everyday core is "
-        "supplied in server initialization instructions."
+        "core-reference covers every indexed page in Igor Basics, Analysis, Graphing/Making Figures, "
+        "Data, User Interface, and Programming, plus the bounded common-command allowlist. Other "
+        "command-catalog and specialist-extension pages default to on-demand. Tiers control retrieval "
+        "availability only; manual pages are not preloaded at startup. Compact authored operational "
+        "guidance is supplied separately in server initialization instructions."
     )
+    bundle["knowledge_tier_categories"] = {
+        key: {"tier": "core-reference", "scope": value}
+        for key, value in CORE_REFERENCE_GROUPS.items()
+    }
+    bundle["knowledge_tier_categories"]["common-commands"] = {
+        "tier": "core-reference",
+        "scope": "Explicitly allowlisted command pages used in routine wave, data, analysis, and graph workflows.",
+    }
+    bundle["knowledge_tier_categories"]["command-catalog"] = {
+        "tier": "on-demand",
+        "scope": "Remaining command catalog pages; queried when a task needs a specific operation.",
+    }
+    bundle["knowledge_tier_categories"]["specialist-reference"] = {
+        "tier": "on-demand",
+        "scope": "Extensions and other specialist pages outside the broad core-reference sections.",
+    }
     source_scope = bundle.setdefault("source_scope", {})
     source_scope["official_online_knowledge_tier_counts"] = online_counts
     source_scope["all_document_knowledge_tier_counts"] = total_counts
@@ -484,6 +635,9 @@ def update_bundle(output: Path, include_existing: Path | None = None) -> tuple[i
     except UnicodeDecodeError as exc:
         raise ValueError("WaveMetrics llms.txt is not valid UTF-8") from exc
     pages = parse_index(index_text)
+    planned_paths = [_official_bundle_path(page["url"]) for page in pages]
+    if len({path.casefold() for path in planned_paths}) != len(planned_paths):
+        raise ValueError("Different index URLs resolve to the same compact official bundle path")
     retrieved = datetime.now(timezone.utc).isoformat(timespec="seconds")
     stage = Path(tempfile.mkdtemp(prefix=f".{target.name}.stage-", dir=target.parent))
     total_bytes = 0
@@ -505,7 +659,7 @@ def update_bundle(output: Path, include_existing: Path | None = None) -> tuple[i
             if total_bytes + len(raw) > MAX_TOTAL_BYTES:
                 raise ValueError(f"Downloaded pages exceed the {MAX_TOTAL_BYTES:,}-byte total limit")
             total_bytes += len(raw)
-        relative = "official/online/" + page["relative_path"]
+        relative = _official_bundle_path(page["url"])
         destination = _safe_relative(stage, relative)
         destination.parent.mkdir(parents=True, exist_ok=True)
         destination.write_bytes(bundled)
@@ -553,6 +707,11 @@ def update_bundle(output: Path, include_existing: Path | None = None) -> tuple[i
             "bundle": {
                 "name": "Igor Pro local WaveMetrics documentation",
                 "description": "Index-listed WaveMetrics Markdown downloaded for local use, plus the eight bundled project guides.",
+                "path_layout": "official/<source path after the leading igorpro segment>/...",
+                "path_layout_policy": (
+                    "Index-listed /igorpro/... pages are stored directly under official/ without the redundant "
+                    "online/igorpro prefix. Document IDs and source URLs retain their original values."
+                ),
                 "source_scope": {
                     "source_index_url": INDEX_URL,
                     "source_index_sha256": _sha256(index_bytes),
@@ -623,7 +782,7 @@ def merge_downloaded_bundle(downloaded_bundle: Path, output: Path, include_exist
     if not isinstance(documents, list):
         raise ValueError("Downloaded source bundle has no documents list")
     guides: list[dict[str, Any]] = []
-    online_docs: list[tuple[dict[str, Any], bytes]] = []
+    online_docs: list[tuple[dict[str, Any], dict[str, Any], bytes]] = []
     seen_ids: set[str] = set()
     for record in documents:
         if not isinstance(record, dict) or not isinstance(record.get("id"), str):
@@ -640,7 +799,10 @@ def merge_downloaded_bundle(downloaded_bundle: Path, output: Path, include_exist
             source_url = record.get("source_url", "")
             _safe_url(source_url)
             _path, data = _validate_source_record(downloaded, record)
-            online_docs.append((copy.deepcopy(record), data))
+            original = copy.deepcopy(record)
+            mapped = copy.deepcopy(record)
+            mapped["path"] = _official_bundle_path(source_url)
+            online_docs.append((mapped, original, data))
         else:
             raise ValueError(f"Unexpected document in downloaded-only bundle: {record['id']}")
     expected_online = source_scope.get("official_document_count")
@@ -655,13 +817,23 @@ def merge_downloaded_bundle(downloaded_bundle: Path, output: Path, include_exist
     stage = Path(tempfile.mkdtemp(prefix=f".{target.name}.stage-", dir=target.parent))
     try:
         occupied: dict[str, str] = {}
-        for record, data in online_docs:
+        mapped_path_keys: set[str] = set()
+        for record, original, data in online_docs:
+            path_key = record["path"].casefold()
+            if path_key in mapped_path_keys:
+                raise ValueError(f"Online documents collide in compact bundle layout: {record['path']}")
+            mapped_path_keys.add(path_key)
             _copy_preserved_file(stage, record["path"], data, occupied)
+            assets = _copy_document_assets(downloaded, stage, original, record["path"], data, occupied)
+            if assets:
+                record["bundle_assets"] = assets
+            else:
+                record.pop("bundle_assets", None)
 
         guide_records, preserved_manuals, preserved_asset_count = _merge_existing_bundles(
             [local], stage, guides, occupied
         )
-        online_ids = {record["id"] for record, _data in online_docs}
+        online_ids = {record["id"] for record, _original, _data in online_docs}
         collisions = online_ids.intersection(record["id"] for record in preserved_manuals)
         if collisions:
             raise ValueError(f"Local manual IDs collide with online documents: {sorted(collisions)[:5]}")
@@ -676,7 +848,7 @@ def merge_downloaded_bundle(downloaded_bundle: Path, output: Path, include_exist
             "document_count": len(preserved_manuals),
         }
         manifest["bundle"]["collections"]["manuals"]["document_count"] = len(online_docs) + len(preserved_manuals)
-        manifest["documents"] = guide_records + preserved_manuals + [record for record, _data in online_docs]
+        manifest["documents"] = guide_records + preserved_manuals + [record for record, _original, _data in online_docs]
         apply_knowledge_tiers(manifest)
         manifest_path = stage / "manifest.json"
         manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -695,6 +867,101 @@ def merge_downloaded_bundle(downloaded_bundle: Path, output: Path, include_exist
                 previous.replace(target)
             raise
         return len(online_docs), manifest_hash
+    finally:
+        if stage.exists():
+            shutil.rmtree(stage)
+
+
+def restructure_bundle(source_bundle: Path, output: Path) -> tuple[int, str]:
+    """Offline-copy a validated bundle into the compact official path layout.
+
+    Document IDs, Markdown bytes, and source provenance are preserved. Online
+    index pages move from official/online/igorpro/... to official/...; relative
+    assets move with their document-relative paths. The source is never edited.
+    """
+    project_root = Path(__file__).resolve().parents[1]
+    target = _ensure_output_safe(project_root, output)
+    source = source_bundle.expanduser().resolve()
+    if source == target or source.is_relative_to(target) or target.is_relative_to(source):
+        raise ValueError("Output and source bundle must be separate, non-overlapping directories")
+    if not source.is_dir():
+        raise ValueError(f"Source knowledge bundle is not a directory: {source}")
+    manifest_path = source / "manifest.json"
+    if not manifest_path.is_file():
+        raise ValueError(f"Source knowledge bundle has no manifest.json: {source}")
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Cannot read source bundle manifest: {manifest_path}") from exc
+    if not isinstance(manifest, dict) or not isinstance(manifest.get("documents"), list):
+        raise ValueError("Source knowledge bundle has no documents list")
+    _validate_manifest(source, manifest)
+
+    remapped = 0
+    mapped_paths: set[str] = set()
+    prepared: list[tuple[dict[str, Any], dict[str, Any], bytes]] = []
+    for original in manifest["documents"]:
+        if not isinstance(original, dict) or not isinstance(original.get("id"), str):
+            raise ValueError("Source bundle contains an invalid document record")
+        _source_file, data = _validate_source_record(source, original)
+        record = copy.deepcopy(original)
+        if (
+            record.get("collection") == "manuals"
+            and record.get("source_index_url") == INDEX_URL
+        ):
+            record["path"] = _official_bundle_path(str(record.get("source_url", "")))
+        path_key = str(record.get("path", "")).casefold()
+        if path_key in mapped_paths:
+            raise ValueError(f"Documents collide in compact bundle layout: {record.get('path')}")
+        mapped_paths.add(path_key)
+        if record["path"] != original["path"]:
+            remapped += 1
+        prepared.append((record, original, data))
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if target.exists() and (target.is_symlink() or not target.is_dir()):
+        raise ValueError(f"Output must be a normal directory, not a link or file: {target}")
+    stage = Path(tempfile.mkdtemp(prefix=f".{target.name}.stage-", dir=target.parent))
+    try:
+        occupied: dict[str, str] = {}
+        output_records: list[dict[str, Any]] = []
+        for record, original, data in prepared:
+            _copy_preserved_file(stage, record["path"], data, occupied)
+            assets = _copy_document_assets(source, stage, original, record["path"], data, occupied)
+            if assets:
+                record["bundle_assets"] = assets
+            else:
+                record.pop("bundle_assets", None)
+            output_records.append(record)
+
+        output_manifest = copy.deepcopy(manifest)
+        output_manifest["documents"] = output_records
+        bundle = output_manifest.setdefault("bundle", {})
+        bundle["path_layout"] = "official/<source path after the leading igorpro segment>/..."
+        bundle["path_layout_policy"] = (
+            "Index-listed /igorpro/... pages are stored directly under official/ without the redundant "
+            "online/igorpro prefix. Document IDs and source URLs retain their original values."
+        )
+        apply_knowledge_tiers(output_manifest)
+        output_manifest_path = stage / "manifest.json"
+        output_manifest_path.write_text(
+            json.dumps(output_manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+        )
+        _validate_manifest(stage, output_manifest)
+        digest = _sha256(output_manifest_path.read_bytes())
+
+        previous = None
+        if target.exists():
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            previous = target.with_name(f"{target.name}.previous-{stamp}-{uuid.uuid4().hex[:8]}")
+            target.replace(previous)
+        try:
+            stage.replace(target)
+        except Exception:
+            if previous is not None and not target.exists():
+                previous.replace(target)
+            raise
+        return remapped, digest
     finally:
         if stage.exists():
             shutil.rmtree(stage)
@@ -772,14 +1039,23 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--include-existing", type=Path, help="preserve local manuals/assets and matching guides from an existing compatible bundle")
     parser.add_argument("--merge-downloaded", type=Path, help="offline-merge this validated downloaded bundle instead of fetching the index")
     parser.add_argument("--retier-bundle", type=Path, help="validate a local bundle and atomically update only its tier metadata; performs no network request")
+    parser.add_argument("--restructure-bundle", type=Path, help="offline-copy a bundle into the compact official/<section>/ layout; preserves source and document IDs")
     args = parser.parse_args(argv)
     try:
         if args.retier_bundle is not None:
-            if args.merge_downloaded is not None or args.include_existing is not None:
-                parser.error("--retier-bundle cannot be combined with merge options")
+            if args.merge_downloaded is not None or args.include_existing is not None or args.restructure_bundle is not None:
+                parser.error("--retier-bundle cannot be combined with merge or restructure options")
             counts, manifest_hash = retier_bundle_manifest(args.retier_bundle)
             print(f"Knowledge tiers updated: {args.retier_bundle.resolve()}")
             print(f"Core-reference: {counts['core-reference']}; on-demand: {counts['on-demand']}")
+            print(f"Manifest SHA-256: {manifest_hash}")
+            return 0
+        if args.restructure_bundle is not None:
+            if args.merge_downloaded is not None or args.include_existing is not None:
+                parser.error("--restructure-bundle cannot be combined with merge options")
+            count, manifest_hash = restructure_bundle(args.restructure_bundle, args.output)
+            print(f"Knowledge bundle restructured: {args.output.resolve()}")
+            print(f"Official document paths remapped: {count}")
             print(f"Manifest SHA-256: {manifest_hash}")
             return 0
         if args.merge_downloaded is not None:
