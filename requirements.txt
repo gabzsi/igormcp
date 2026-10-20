@@ -1,0 +1,4 @@
+# FastMCP is a maintained MCP 1.x compatibility API. Pin below v2 until this
+# server is deliberately migrated to MCPServer and its new handler model.
+mcp>=1.28,<2
+pywin32>=308

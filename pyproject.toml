@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "igor-pro-mcp"
+version = "0.2.0"
+description = "Windows Igor Pro MCP server with bundled Markdown knowledge"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["mcp>=1.28,<2", "pywin32>=308; sys_platform == 'win32'"]
+classifiers = ["Operating System :: Microsoft :: Windows", "Programming Language :: Python :: 3"]
+
+[project.scripts]
+igor-pro-mcp = "igor_mcp_server:main"
+
+[tool.setuptools]
+py-modules = ["igor_mcp_server", "igor_knowledge", "igor_sessions"]
+packages = ["knowledge"]
+
+[tool.setuptools.package-data]
+knowledge = ["**/*.md", "**/*.png", "*.json"]

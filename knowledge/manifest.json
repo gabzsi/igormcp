@@ -1,0 +1,83 @@
+{
+  "schema_version": 1,
+  "bundle": {
+    "name": "Igor Pro MCP curated knowledge",
+    "description": "Eight project-authored Igor Pro guides. Official WaveMetrics manuals are not bundled.",
+    "collections": {
+      "manuals": {
+        "description": "No official manual content is bundled. Use an authorized compatible bundle through IGOR_KNOWLEDGE_DIR.",
+        "document_count": 0
+      },
+      "guides": {
+        "description": "Project-authored technical guides for Igor Pro workflows.",
+        "document_count": 8
+      }
+    }
+  },
+  "documents": [
+    {
+      "id": "guides/Igor-Pro-10-Automation-and-COM.md",
+      "path": "curated/Igor-Pro-10-Automation-and-COM.md",
+      "collection": "guides",
+      "title": "Igor-Pro-10-Automation-and-COM",
+      "bundle_sha256": "D46FAE7B0BC9C417EE8FDE0F6C08E229DE536754F4FCEB4A71D85E451A5A5FD6",
+      "provenance": "Project-authored technical guide; consult WaveMetrics documentation for authoritative product details."
+    },
+    {
+      "id": "guides/Igor-Pro-10-Curve-Fitting.md",
+      "path": "curated/Igor-Pro-10-Curve-Fitting.md",
+      "collection": "guides",
+      "title": "Igor-Pro-10-Curve-Fitting",
+      "bundle_sha256": "DA19D50C1D0DA1507C7DAD475C21B435F4B5DF25EDAD19050B3B2C5E5CA33D5F",
+      "provenance": "Project-authored technical guide; consult WaveMetrics documentation for authoritative product details."
+    },
+    {
+      "id": "guides/Igor-Pro-10-Data-Folders.md",
+      "path": "curated/Igor-Pro-10-Data-Folders.md",
+      "collection": "guides",
+      "title": "Igor-Pro-10-Data-Folders",
+      "bundle_sha256": "557FA0AF5E49CBA7164737C44B748CB18EE99F1D0A9C66983516D14028AF5337",
+      "provenance": "Project-authored technical guide; consult WaveMetrics documentation for authoritative product details."
+    },
+    {
+      "id": "guides/Igor-Pro-10-Syntax-and-Commands.md",
+      "path": "curated/Igor-Pro-10-Syntax-and-Commands.md",
+      "collection": "guides",
+      "title": "Igor-Pro-10-Syntax-and-Commands",
+      "bundle_sha256": "C0079BEAC4AF806F73F5388F55AFA24E6591AA64FCA2589D103BF1120D2C7597",
+      "provenance": "Project-authored technical guide; consult WaveMetrics documentation for authoritative product details."
+    },
+    {
+      "id": "guides/Igor-Pro-10-Wave-Architecture.md",
+      "path": "curated/Igor-Pro-10-Wave-Architecture.md",
+      "collection": "guides",
+      "title": "Igor-Pro-10-Wave-Architecture",
+      "bundle_sha256": "17BA14520DB6C76B0B4E1827E6B6F419400B5B63735379284506F423BBBC0C91",
+      "provenance": "Project-authored technical guide; consult WaveMetrics documentation for authoritative product details."
+    },
+    {
+      "id": "guides/Igor-Pro-Figure-Making-and-Publication-Styling.md",
+      "path": "curated/Igor-Pro-Figure-Making-and-Publication-Styling.md",
+      "collection": "guides",
+      "title": "Igor-Pro-Figure-Making-and-Publication-Styling",
+      "bundle_sha256": "A56F61AD8948B836FF2467AE1542A845EB0156E686E9421AE5DA6A102B4FC147",
+      "provenance": "Project-authored technical guide; consult WaveMetrics documentation for authoritative product details."
+    },
+    {
+      "id": "guides/Igor-Pro-Gotchas-and-Pitfalls.md",
+      "path": "curated/Igor-Pro-Gotchas-and-Pitfalls.md",
+      "collection": "guides",
+      "title": "Igor-Pro-Gotchas-and-Pitfalls",
+      "bundle_sha256": "D466B5BB4DEE7E83D2F604343321F67F1A6AC84C423556E371ECB55CD297C7C0",
+      "provenance": "Project-authored technical guide; consult WaveMetrics documentation for authoritative product details."
+    },
+    {
+      "id": "guides/Python-NumPy-to-Igor-Pro-Rosetta-Stone.md",
+      "path": "curated/Python-NumPy-to-Igor-Pro-Rosetta-Stone.md",
+      "collection": "guides",
+      "title": "Python-NumPy-to-Igor-Pro-Rosetta-Stone",
+      "bundle_sha256": "AEB03CFE8ECA4CF6548255AE1D845984A909E9D8949D33BA4F527B390DFCE7D2",
+      "provenance": "Project-authored technical guide; consult WaveMetrics documentation for authoritative product details."
+    }
+  ]
+}

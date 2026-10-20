@@ -1,0 +1,51 @@
+# Python bytecode & caches
+__pycache__/
+*.py[cod]
+*$py.class
+**/*.pyc
+**/__pycache__/
+
+# Virtual environments & local python runtimes
+.venv/
+**/.venv/
+**/.venv*/
+.python/
+**/.python/
+
+# Ephemeral scratch data and probe scripts
+tmp/
+build/
+dist/
+*.egg-info/
+
+# OS artifacts
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Per-user Claude Code overrides
+.claude/settings.local.json
+
+# Local Igor call logs and session summaries
+/sessions/
+
+# Local credentials and user-specific host routing
+.env
+.env.*
+!.env.example
+/secrets/
+*.secret
+*.pem
+*.key
+*.p12
+*.pfx
+/.agents/mcp_config.json
+/.codex/config.toml
+
+# Runtime logs and generated outputs
+*.log
+/logs/
+/artifacts/
+
+# Locally installed WaveMetrics help exports; excluded from public distribution
+/knowledge/official/
