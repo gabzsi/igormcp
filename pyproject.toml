@@ -19,4 +19,4 @@ py-modules = ["igor_mcp_server", "igor_knowledge", "igor_sessions"]
 packages = ["knowledge"]
 
 [tool.setuptools.package-data]
-knowledge = ["**/*.md", "**/*.png", "*.json"]
+knowledge = ["curated/*.md", "manifest.json", "README.md"]
