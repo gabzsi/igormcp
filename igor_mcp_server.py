@@ -21,13 +21,15 @@ import tempfile
 import threading
 import time
 import uuid
-from contextlib import contextmanager
+from collections import deque
+from contextlib import contextmanager, suppress
 from ctypes import WINFUNCTYPE, byref, create_unicode_buffer, windll
 from ctypes import wintypes
 from typing import Annotated, Any, Iterable, Literal, TypedDict
 
 from pydantic import Field
 from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp.exceptions import ToolError
 from mcp.types import CallToolResult, ImageContent, TextContent, ToolAnnotations
 import igor_knowledge
 import igor_pipe
@@ -49,7 +51,7 @@ except Exception as _e:  # pywin32 missing or broken; tools report it clearly.
     _PYWIN32_IMPORT_ERROR = str(_e)
 
 
-_SERVER_VERSION = "0.3.0"
+_SERVER_VERSION = "0.4.0"
 _PROGIDS = ("IgorPro.Application", "Igor.Application")
 _MIN_IGOR_VERSION = 6.0
 _WAVE_TYPE_SELECTOR_VERSION = 6.1
@@ -126,6 +128,23 @@ _VALID_TOOL_PROFILES = frozenset({"full", "core"})
 _OPTIONAL_REPORT_TOOL_NAMES = frozenset(
     {"create_html_report", "open_report_graph", "apply_html_report"}
 )
+_PROGRESS_HEARTBEAT_INITIAL_DELAY_SECONDS = 2.0
+_PROGRESS_HEARTBEAT_INTERVAL_SECONDS = 2.0
+_PROGRESS_HEARTBEAT_TOOL_NAMES = frozenset(
+    {
+        "execute_igor",
+        "call_function",
+        "create_html_report",
+        "apply_html_report",
+        "compile_procedures",
+    }
+)
+_INSPECT_MIN_DEPTH = 1
+_INSPECT_MAX_DEPTH = 10
+_INSPECT_MIN_FOLDERS = 1
+_INSPECT_MAX_FOLDERS = 200
+_INSPECT_MAX_WAVES_PER_FOLDER = 20
+_INSPECT_WINDOW_TYPES = ("graph", "table", "layout", "panel", "notebook", "gizmo")
 _MIN_USER_TIMEOUT_SECONDS = 1.0
 _MAX_USER_TIMEOUT_SECONDS = 600.0
 _PIPE_WORKER_TIMEOUT_GRACE_SECONDS = 3.0
@@ -223,8 +242,28 @@ def _tool_profile() -> str:
     return profile if profile in _VALID_TOOL_PROFILES else "full"
 
 
+async def _progress_heartbeat_loop(ctx, tool_name: str, started_at: float) -> None:
+    """Emit periodic MCP progress notifications while a long-running tool executes."""
+    try:
+        await asyncio.sleep(_PROGRESS_HEARTBEAT_INITIAL_DELAY_SECONDS)
+        while True:
+            elapsed = time.monotonic() - started_at
+            try:
+                await ctx.report_progress(
+                    progress=round(elapsed, 2),
+                    total=None,
+                    message=f"{tool_name} running ({elapsed:.0f}s)...",
+                )
+            except Exception:
+                # Best-effort heartbeat: never fail a running tool call.
+                return
+            await asyncio.sleep(_PROGRESS_HEARTBEAT_INTERVAL_SECONDS)
+    except asyncio.CancelledError:
+        return
+
+
 class IgorFastMCP(FastMCP):
-    """FastMCP wrapper for best-effort call memory, tool profiles, and structured tool errors."""
+    """FastMCP wrapper for best-effort call memory, tool profiles, progress heartbeats, and structured tool errors."""
 
     async def list_tools(self):
         tools = await super().list_tools()
@@ -234,9 +273,48 @@ class IgorFastMCP(FastMCP):
             ]
         return tools
 
-    async def call_tool(self, name: str, arguments: dict[str, object]):
+    def _active_progress_context(self):
+        """Return the active Context when the current MCP request supplied a progressToken."""
         try:
-            result = await super().call_tool(name, arguments)
+            ctx = self.get_context()
+            req_ctx = ctx.request_context
+        except (LookupError, ValueError):
+            return None
+        meta = getattr(req_ctx, "meta", None)
+        if meta is None or getattr(meta, "progressToken", None) is None:
+            return None
+        return ctx
+
+    async def _call_tool_offloaded(self, name: str, arguments: dict[str, object]):
+        """Run a sync tool in a worker thread so the event loop can emit progress heartbeats."""
+        tool = self._tool_manager.get_tool(name)
+        if tool is None or tool.is_async or tool.context_kwarg is not None:
+            return await super().call_tool(name, arguments)
+        try:
+            pre_parsed = tool.fn_metadata.pre_parse_json(arguments)
+            parsed_model = tool.fn_metadata.arg_model.model_validate(pre_parsed)
+            parsed_dict = parsed_model.model_dump_one_level()
+            raw_result = await asyncio.to_thread(tool.fn, **parsed_dict)
+            return tool.fn_metadata.convert_result(raw_result)
+        except Exception as exc:
+            raise ToolError(f"Error executing tool {tool.name}: {exc}") from exc
+
+    async def call_tool(self, name: str, arguments: dict[str, object]):
+        heartbeat_task: asyncio.Task[None] | None = None
+        progress_ctx = (
+            self._active_progress_context()
+            if name in _PROGRESS_HEARTBEAT_TOOL_NAMES
+            else None
+        )
+        try:
+            if progress_ctx is not None:
+                started_at = time.monotonic()
+                heartbeat_task = asyncio.create_task(
+                    _progress_heartbeat_loop(progress_ctx, name, started_at)
+                )
+                result = await self._call_tool_offloaded(name, arguments)
+            else:
+                result = await super().call_tool(name, arguments)
         except BaseException as exc:
             status = "cancelled" if isinstance(exc, asyncio.CancelledError) else "raised"
             _record_tool_call_best_effort(
@@ -247,6 +325,11 @@ class IgorFastMCP(FastMCP):
                 status=status,
             )
             raise
+        finally:
+            if heartbeat_task is not None:
+                heartbeat_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await heartbeat_task
 
         structured_result = _structured_tool_result(result)
         is_error = _is_error_result(name, result)
@@ -287,8 +370,10 @@ mcp = IgorFastMCP(
         "processing across datasets, reusable routines, or an explicit request. "
         "A large wave handled by one built-in command does not need a procedure. "
         "Prefer call_function for direct typed return values over Print; use "
-        "capture_window to visually verify plots, compile_procedures for silent "
-        ".ipf reload/compile, and abort_igor to cancel hung server commands. "
+        "inspect_experiment for a single-shot overview of folders, waves, and "
+        "windows, capture_window to visually verify plots, compile_procedures "
+        "for silent .ipf reload/compile, and abort_igor to cancel hung server "
+        "commands. "
         "For complex procedure work, inspect data first, write one bounded "
         "procedure, load/compile it, and verify outputs without blindly retrying "
         "after an unknown result. "
@@ -487,6 +572,45 @@ class DelimitedImportResult(TypedDict):
     waves: list[str]
     headers: list[str]
     portable_object_name_limit: int
+
+
+class InspectExperimentInfo(TypedDict):
+    name: str
+    file_name: str
+    path: str
+    saved: bool
+
+
+class InspectFolderSummary(TypedDict):
+    path: str
+    depth: int
+    wave_count: int
+    variable_count: int
+    string_count: int
+    subfolder_count: int
+    waves: list[str]
+    waves_truncated: bool
+
+
+class InspectWindowsSummary(TypedDict):
+    graph: list[str]
+    table: list[str]
+    layout: list[str]
+    panel: list[str]
+    notebook: list[str]
+    gizmo: list[str]
+
+
+class InspectExperimentResult(TypedDict):
+    ok: bool
+    transport: Literal["pipe", "com"]
+    experiment: InspectExperimentInfo
+    root_folder: str
+    folder_count: int
+    total_waves: int
+    truncated: bool
+    folders: list[InspectFolderSummary]
+    windows: InspectWindowsSummary
 
 
 class IgorError(Exception):
@@ -5348,6 +5472,390 @@ def get_system_information() -> dict[str, object]:
         }
 
     return _with_igor(operation, auto_start=False)
+
+
+def _normalize_inspect_root_folder(root_folder: str) -> str:
+    """Validate and normalize a data-folder path for inspect_experiment."""
+    if not isinstance(root_folder, str) or not root_folder.strip():
+        raise IgorError("root_folder must be a non-empty Igor data-folder path")
+    if "\x00" in root_folder or "\r" in root_folder or "\n" in root_folder:
+        raise IgorError("root_folder cannot contain null bytes or newlines")
+    normalized = root_folder.strip()
+    if not normalized.endswith(":"):
+        normalized += ":"
+    if not normalized.startswith("root:"):
+        raise IgorError("root_folder must start with 'root:'")
+    if "::" in normalized:
+        raise IgorError("root_folder contains an empty path component")
+    return normalized
+
+
+def _join_igor_data_folder(parent: str, child_name: str) -> str:
+    """Join a normalized parent data-folder path (ending in ':') and a child name."""
+    if _PORTABLE_IGOR_NAME_PATTERN.fullmatch(child_name):
+        return f"{parent}{child_name}:"
+    if child_name.startswith("'") and child_name.endswith("'") and len(child_name) >= 2:
+        return f"{parent}{child_name}:"
+    return f"{parent}'{child_name}':"
+
+
+def _clamp_inspect_int(value: int, *, label: str, minimum: int, maximum: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise IgorError(f"{label} must be an integer")
+    return max(minimum, min(maximum, value))
+
+
+def _inspect_experiment_via_pipe(
+    client: igor_pipe.IgorPipeClient,
+    *,
+    root_folder: str,
+    max_depth: int,
+    max_folders: int,
+    include_wave_names: bool,
+) -> InspectExperimentResult:
+    """Inspect experiment metadata, folder tree, and windows over native pipe."""
+    exists_resp = client.call_function(
+        "DataFolderExists", [root_folder], timeout_seconds=10.0
+    )
+    try:
+        folder_exists = int(exists_resp.get("value")) == 1
+    except (TypeError, ValueError):
+        folder_exists = False
+    if not folder_exists:
+        raise IgorError(f"Data folder '{root_folder}' does not exist")
+
+    exp_name = str(
+        client.call_function("IgorInfo", [1], timeout_seconds=10.0).get("value", "")
+        or ""
+    ).strip()
+    exp_file_name = str(
+        client.call_function("IgorInfo", [12], timeout_seconds=10.0).get("value", "")
+        or ""
+    ).strip()
+    exp_path = ""
+    if exp_file_name:
+        path_resp = client.execute_command(
+            'PathInfo home; fprintf 0, "%s", ParseFilePath(5, S_path, "*", 0, 0)',
+            timeout_seconds=10.0,
+        )
+        if path_resp.get("errorCode"):
+            raise IgorError(
+                f"Failed to resolve experiment home path: "
+                f"{path_resp.get('errorMessage') or path_resp.get('errorCode')}"
+            )
+        exp_path = str(path_resp.get("results", "") or "").strip()
+
+    folders: list[InspectFolderSummary] = []
+    queue: deque[tuple[str, int]] = deque([(root_folder, 0)])
+    total_waves = 0
+    truncated = False
+
+    while queue:
+        if len(folders) >= max_folders:
+            truncated = True
+            break
+        folder_path, depth = queue.popleft()
+        wave_count = _pipe_call_int(client, "CountObjects", [folder_path, 1])
+        variable_count = _pipe_call_int(client, "CountObjects", [folder_path, 2])
+        string_count = _pipe_call_int(client, "CountObjects", [folder_path, 3])
+        subfolder_count = _pipe_call_int(client, "CountObjects", [folder_path, 4])
+        total_waves += wave_count
+
+        waves: list[str] = []
+        waves_truncated = False
+        if include_wave_names and wave_count > 0:
+            limit = min(wave_count, _INSPECT_MAX_WAVES_PER_FOLDER)
+            waves_truncated = wave_count > _INSPECT_MAX_WAVES_PER_FOLDER
+            for idx in range(limit):
+                w_resp = client.call_function(
+                    "GetIndexedObjName", [folder_path, 1, idx], timeout_seconds=10.0
+                )
+                w_name = str(w_resp.get("value", "") or "").strip()
+                if w_name:
+                    waves.append(w_name)
+
+        folders.append(
+            {
+                "path": folder_path,
+                "depth": depth,
+                "wave_count": wave_count,
+                "variable_count": variable_count,
+                "string_count": string_count,
+                "subfolder_count": subfolder_count,
+                "waves": waves,
+                "waves_truncated": waves_truncated,
+            }
+        )
+
+        if subfolder_count > 0:
+            if depth + 1 >= max_depth:
+                truncated = True
+            else:
+                for idx in range(subfolder_count):
+                    if len(folders) + len(queue) >= max_folders:
+                        truncated = True
+                        break
+                    sub_resp = client.call_function(
+                        "GetIndexedObjName", [folder_path, 4, idx], timeout_seconds=10.0
+                    )
+                    sub_name = str(sub_resp.get("value", "") or "").strip()
+                    if sub_name:
+                        queue.append(
+                            (_join_igor_data_folder(folder_path, sub_name), depth + 1)
+                        )
+
+    windows_map: dict[str, list[str]] = {}
+    for win_type in _INSPECT_WINDOW_TYPES:
+        bit = _WINDOW_TYPE_BITS[win_type]
+        win_resp = client.call_function(
+            "WinList", ["*", ";", f"WIN:{bit}"], timeout_seconds=10.0
+        )
+        raw_list = str(win_resp.get("value", "") or "")
+        windows_map[win_type] = [w for w in raw_list.split(";") if w.strip()]
+
+    return {
+        "ok": True,
+        "transport": "pipe",
+        "experiment": {
+            "name": exp_name or "(untitled)",
+            "file_name": exp_file_name,
+            "path": exp_path,
+            "saved": bool(exp_file_name),
+        },
+        "root_folder": root_folder,
+        "folder_count": len(folders),
+        "total_waves": total_waves,
+        "truncated": truncated,
+        "folders": folders,
+        "windows": {
+            "graph": windows_map["graph"],
+            "table": windows_map["table"],
+            "layout": windows_map["layout"],
+            "panel": windows_map["panel"],
+            "notebook": windows_map["notebook"],
+            "gizmo": windows_map["gizmo"],
+        },
+    }
+
+
+def _inspect_experiment_via_com(
+    app,
+    *,
+    root_folder: str,
+    max_depth: int,
+    max_folders: int,
+    include_wave_names: bool,
+) -> InspectExperimentResult:
+    """Inspect experiment metadata, folder tree, and windows over COM."""
+    escaped_root = _igor_escape(root_folder)
+    if _query(app, "%d", f'DataFolderExists("{escaped_root}")').strip() != "1":
+        raise IgorError(f"Data folder '{root_folder}' does not exist")
+
+    exp_name = _query(app, "%s", "IgorInfo(1)").strip()
+    exp_file_name = _query(app, "%s", "IgorInfo(12)").strip()
+    exp_path = ""
+    if exp_file_name:
+        _execute_command(app, "PathInfo home")
+        exp_path = _query(
+            app, "%s", 'ParseFilePath(5, S_path, "*", 0, 0)'
+        ).strip()
+
+    folders: list[InspectFolderSummary] = []
+    queue: deque[tuple[str, int]] = deque([(root_folder, 0)])
+    total_waves = 0
+    truncated = False
+
+    while queue:
+        if len(folders) >= max_folders:
+            truncated = True
+            break
+        folder_path, depth = queue.popleft()
+        escaped_path = _igor_escape(folder_path)
+        counts_raw = _query(
+            app,
+            "%d|%d|%d|%d",
+            f'CountObjects("{escaped_path}", 1), CountObjects("{escaped_path}", 2), '
+            f'CountObjects("{escaped_path}", 3), CountObjects("{escaped_path}", 4)',
+        ).strip()
+        try:
+            wave_count, variable_count, string_count, subfolder_count = (
+                int(part.strip()) for part in counts_raw.split("|", 3)
+            )
+        except ValueError as exc:
+            raise IgorError(
+                f"Igor returned invalid object counts for '{folder_path}': {counts_raw!r}"
+            ) from exc
+        total_waves += wave_count
+
+        waves: list[str] = []
+        waves_truncated = False
+        if include_wave_names and wave_count > 0:
+            limit = min(wave_count, _INSPECT_MAX_WAVES_PER_FOLDER)
+            waves_truncated = wave_count > _INSPECT_MAX_WAVES_PER_FOLDER
+            for idx in range(limit):
+                w_name = _query(
+                    app,
+                    "%s",
+                    f'GetIndexedObjName("{escaped_path}", 1, {idx})',
+                ).strip()
+                if w_name:
+                    waves.append(w_name)
+
+        folders.append(
+            {
+                "path": folder_path,
+                "depth": depth,
+                "wave_count": wave_count,
+                "variable_count": variable_count,
+                "string_count": string_count,
+                "subfolder_count": subfolder_count,
+                "waves": waves,
+                "waves_truncated": waves_truncated,
+            }
+        )
+
+        if subfolder_count > 0:
+            if depth + 1 >= max_depth:
+                truncated = True
+            else:
+                for idx in range(subfolder_count):
+                    if len(folders) + len(queue) >= max_folders:
+                        truncated = True
+                        break
+                    sub_name = _query(
+                        app,
+                        "%s",
+                        f'GetIndexedObjName("{escaped_path}", 4, {idx})',
+                    ).strip()
+                    if sub_name:
+                        queue.append(
+                            (_join_igor_data_folder(folder_path, sub_name), depth + 1)
+                        )
+
+    windows_map: dict[str, list[str]] = {}
+    for win_type in _INSPECT_WINDOW_TYPES:
+        bit = _WINDOW_TYPE_BITS[win_type]
+        raw_list = _query(app, "%s", f'WinList("*", ";", "WIN:{bit}")')
+        windows_map[win_type] = [w for w in raw_list.split(";") if w.strip()]
+
+    return {
+        "ok": True,
+        "transport": "com",
+        "experiment": {
+            "name": exp_name or "(untitled)",
+            "file_name": exp_file_name,
+            "path": exp_path,
+            "saved": bool(exp_file_name),
+        },
+        "root_folder": root_folder,
+        "folder_count": len(folders),
+        "total_waves": total_waves,
+        "truncated": truncated,
+        "folders": folders,
+        "windows": {
+            "graph": windows_map["graph"],
+            "table": windows_map["table"],
+            "layout": windows_map["layout"],
+            "panel": windows_map["panel"],
+            "notebook": windows_map["notebook"],
+            "gizmo": windows_map["gizmo"],
+        },
+    }
+
+
+@mcp.tool(annotations=_READ_ONLY_ANNOTATIONS, structured_output=True)
+def inspect_experiment(
+    root_folder: Annotated[
+        str,
+        Field(
+            description=(
+                "Starting Igor data folder path (normalized with trailing ':', default 'root:')."
+            )
+        ),
+    ] = "root:",
+    max_depth: Annotated[
+        int,
+        Field(
+            ge=1,
+            le=10,
+            description="Maximum data-folder traversal depth (1 to 10, default 4).",
+        ),
+    ] = 4,
+    max_folders: Annotated[
+        int,
+        Field(
+            ge=1,
+            le=200,
+            description="Maximum number of data folders to inspect (1 to 200, default 50).",
+        ),
+    ] = 50,
+    include_wave_names: Annotated[
+        bool,
+        Field(
+            description=(
+                "When true (default), include up to 20 wave names per folder "
+                "along with waves_truncated."
+            )
+        ),
+    ] = True,
+) -> InspectExperimentResult:
+    """Inspect the open Igor experiment in one read-only call without changing the active folder.
+
+    Returns experiment identity, a bounded breadth-first summary of data folders
+    (wave/variable/string/subfolder counts and optional wave names), and open
+    windows grouped by type. Prefers the Igor Pro 10.04+ native JSON-RPC pipe
+    with automatic COM fallback.
+    """
+    normalized_root = _normalize_inspect_root_folder(root_folder)
+    clamped_depth = _clamp_inspect_int(
+        max_depth,
+        label="max_depth",
+        minimum=_INSPECT_MIN_DEPTH,
+        maximum=_INSPECT_MAX_DEPTH,
+    )
+    clamped_folders = _clamp_inspect_int(
+        max_folders,
+        label="max_folders",
+        minimum=_INSPECT_MIN_FOLDERS,
+        maximum=_INSPECT_MAX_FOLDERS,
+    )
+    if not isinstance(include_wave_names, bool):
+        raise IgorError("include_wave_names must be true or false")
+
+    mode = _transport_mode()
+    if mode != "com":
+        client = _try_pipe_client(auto_start=False, timeout_seconds=2.0)
+        if client is not None:
+            try:
+                return _inspect_experiment_via_pipe(
+                    client,
+                    root_folder=normalized_root,
+                    max_depth=clamped_depth,
+                    max_folders=clamped_folders,
+                    include_wave_names=include_wave_names,
+                )
+            except igor_pipe.PipeNotAvailableError as exc:
+                if mode == "pipe":
+                    raise IgorError(str(exc)) from exc
+            except igor_pipe.IgorPipeError as exc:
+                raise IgorError(str(exc)) from exc
+            finally:
+                client.close()
+        elif mode == "pipe":
+            raise IgorError(
+                "No active Igor Pro named-pipe instance found (IGOR_TRANSPORT=pipe)."
+            )
+
+    return _with_igor(
+        lambda app, _version: _inspect_experiment_via_com(
+            app,
+            root_folder=normalized_root,
+            max_depth=clamped_depth,
+            max_folders=clamped_folders,
+            include_wave_names=include_wave_names,
+        ),
+        auto_start=False,
+    )
 
 
 def main() -> None:

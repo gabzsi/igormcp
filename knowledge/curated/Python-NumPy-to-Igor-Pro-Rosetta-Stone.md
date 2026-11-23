@@ -46,7 +46,7 @@ In Python/NumPy, data arrays are dimensionless buffers that require separate X a
 | **Descriptive statistics** | `mean = np.mean(y); std = np.std(y)` | `WaveStats/Q y` | `V_avg` (mean), `V_sdev` (std dev), `V_min`, `V_max`, `V_npnts`, `V_sem`. |
 | **Fast Fourier Transform** | `fy = np.fft.fft(y)` | `FFT/DEST=y_fft y` | Computes complex FFT with automatic frequency axis scaling. |
 | **Inverse FFT** | `y_rec = np.fft.ifft(fy)` | `IFFT/DEST=y_rec y_fft` | Inverse transform restoring time-domain coordinates. |
-| **Integration** | `cum = np.cumsum(y) * dx` | `Integrate y /D=y_int` | Cumulative trapezoidal integration preserving dimension scaling. |
+| **Integration** | `cum = np.cumsum(y) * dx` | `Integrate/T y /D=y_int` | Cumulative trapezoidal integration preserving dimension scaling (`/T` or `/METH=1`; default without `/T` is rectangular `/METH=0`). |
 | **Differentiation** | `dy = np.gradient(y, dx)` | `Differentiate y /D=y_diff` | Central-difference numerical derivative with respect to scaled X. |
 | **Smoothing (Box / Savitzky-Golay)** | `scipy.signal.savgol_filter(y, 11, 2)` | `Smooth/S=2 11, y` | `/S=degree` applies Savitzky-Golay polynomial filtering. |
 | **Peak detection** | `scipy.signal.find_peaks(y, height=0.5)` | `FindPeak/Q/M=0.5 y` | `V_PeakLoc` (x-coord), `V_PeakVal` (y-val), `V_LeadingEdgeLoc`. |
@@ -67,7 +67,7 @@ CurveFit/Q/M=0/W=0 sin, yWave /D
 |---|---|---|
 | **`W_coef`** | `popt` | 1D parameter array: `W_coef[0]=y0`, `[1]=A`, `[2]=omega`, `[3]=phi` |
 | **`W_sigma`** | `np.sqrt(np.diag(pcov))` | 1D standard error array for each coefficient |
-| **`V_chisq`** | $\chi^2 / \text{dof}$ | Reduced Chi-Square goodness of fit |
+| **`V_chisq`** | $\chi^2$ (unreduced) | Sum of squared weighted residuals ($\chi^2$; divide by `V_npnts - numpnts(W_coef)` for reduced $\chi^2$) |
 | **`fit_yWave`** | `y_fit = model(x_fine, *popt)` | Generated model curve added to active graph by `/D` flag |
 | **`V_fitError`** | Fit convergence flag | `0` = converged; non-zero = aborted or singular matrix |
 
@@ -80,7 +80,7 @@ CurveFit/Q/M=0/W=0 sin, yWave /D
 | **Style trace color** | `ax.plot(x, y, color='red', lw=2)` | `ModifyGraph rgb(y)=(65535,0,0), lsize(y)=2` | Igor Pro colors use 16-bit RGB `(0 - 65535)`. |
 | **Scatter markers** | `ax.scatter(x, y, marker='o')` | `ModifyGraph mode(y)=3, marker(y)=19` | `mode=3` enables markers; `marker=19` is filled circle. |
 | **Axis labels & title** | `ax.set_xlabel("Time (s)"); ax.set_ylabel("Voltage (V)")` | `Label bottom "Time (s)"; Label left "Voltage (V)"` | Sets primary coordinate axis titles. |
-| **Legend** | `ax.legend()` | `Legend/C/N=text0/J` | Automatically populates legend from graph trace names. |
+| **Legend** | `ax.legend()` | `Legend/C/N=text0 ""` | Automatically populates legend from graph trace names (omit `/J`, which disables auto-population). |
 
 ## 6. Backward Compatibility Strategy: Igor 10 vs Igor 6
 

@@ -42,26 +42,26 @@ From a local checkout, install with `pip install .` (or `pip install -e .`) and 
 | `IGOR_TRANSPORT` | `auto` | Transport selection: `auto` (prefer Igor Pro 10.04+ native JSON-RPC named pipe, fall back to COM), `pipe` (require native pipe), or `com` (force COM). |
 | `IGOR_PIPE_NAME` | _(auto-discovered)_ | Explicit Windows named pipe path (e.g. `\\.\pipe\IgorPro-...`) to bypass `IgorProInstances.json` discovery. |
 | `IGOR_VERSION_PREFIX` | _(none)_ | Filter auto-discovered native-pipe instances by Igor Pro version prefix (e.g. `10.5`). |
-| `IGOR_TOOL_PROFILE` | `full` | Exposed MCP tool set: `full` (all 33 tools) or `core` (30 tools, omitting the 3 optional HTML report tools for leaner eager-host contexts). |
+| `IGOR_TOOL_PROFILE` | `full` | Exposed MCP tool set: `full` (all 34 tools) or `core` (31 tools, omitting the 3 optional HTML report tools for leaner eager-host contexts). |
 | `IGOR_PRO_EXE` | `C:\Program Files\WaveMetrics\Igor Pro 10 Folder\IgorBinaries_x64\Igor64.exe` | Path to `Igor64.exe` / `Igor.exe` used by `ensure_igor` when starting Igor. |
 | `IGOR_KNOWLEDGE_DIR` | _(bundled guides only)_ | Directory containing the validated local WaveMetrics Markdown bundle used by `query_igor_help`. |
 | `IGOR_SESSION_DIR` | `%LOCALAPPDATA%\igor-mcp\sessions` | Directory where automatic JSONL tool logs and `capture_session` summaries are stored. |
 
 ## What it does
 
-The server exposes 33 tools over MCP stdio:
+The server exposes 34 tools over MCP stdio:
 
 - **Control & execution:** `ensure_igor`, `igor_status`, `execute_igor`, `call_function`, `abort_igor`, `open_igor_experiment`, `import_delimited_text`
-- **Inspect & capture:** `list_waves`, `get_wave_data`, `read_variable`, `list_windows`, `capture_window`, `get_experiment_info`, `get_system_information`
+- **Inspect & capture:** `inspect_experiment`, `list_waves`, `get_wave_data`, `read_variable`, `list_windows`, `capture_window`, `get_experiment_info`, `get_system_information`
 - **Procedures:** `list_procedures`, `open_procedure`, `close_procedure`, `compile_procedures`, `get_compile_status`
 - **Optional HTML reports:** `create_html_report`, `open_report_graph`, `apply_html_report`
 - **State, dialogs, and diagnostics:** `get_igor_state`, `get_igor_dialogs`, `dismiss_igor_dialogs`, `get_igor_compilation_errors`, `dismiss_igor_compilation_errors`
 - **Knowledge:** `query_igor_help`, `search_igor_knowledge`, `read_igor_document`
 - **Session memory:** `search_session_memory`, `read_session_memory`, `capture_session`
 
-Use direct `execute_igor` commands for ordinary calculations, plotting, fitting, inspection, and short command sequences. Use an IPF procedure for ODE simulations, instrument control, repeated loops, substantial batch work, or reusable routines. `igor_status` only checks connectivity; it does not start Igor. `open_igor_experiment` requires Igor to be running and follows normal Igor Open behavior. Unsaved-work prompts remain under the user's control.
+Use direct `execute_igor` commands for ordinary calculations, plotting, fitting, inspection, and short command sequences. Use an IPF procedure for ODE simulations, instrument control, repeated loops, substantial batch work, or reusable routines. `inspect_experiment` returns a single-shot read-only summary of experiment identity, bounded data-folder hierarchy (object counts and optional wave names), and open windows without changing the active folder. `igor_status` only checks connectivity; it does not start Igor. `open_igor_experiment` requires Igor to be running and follows normal Igor Open behavior. Unsaved-work prompts remain under the user's control.
 
-The server serializes Igor commands and bounds response waits. A timeout means the outcome may be unknown: inspect Igor state and diagnostics before retrying. Review dialogs or compiler errors before using an explicit dismissal tool.
+The server serializes Igor commands and bounds response waits. For long-running operations (`execute_igor`, `call_function`, `compile_procedures`, `create_html_report`, `apply_html_report`), the server emits periodic MCP progress heartbeats when the client supplies a `progressToken` so strict MCP hosts do not time out prematurely. A timeout means the outcome may be unknown: inspect Igor state and diagnostics before retrying. Review dialogs or compiler errors before using an explicit dismissal tool.
 
 When starting a new Igor process, the server requests that its main window be shown without activation. It does not intentionally restore or foreground an existing window. Igor or Windows may still affect focus independently.
 

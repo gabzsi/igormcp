@@ -14,19 +14,18 @@ WaveMetrics Igor Pro acts as an ActiveX Automation (COM) server on Microsoft Win
 ## COM Object Model
 
 - **ProgID**: `IgorPro.Application`
-- **Class ID (CLSID)**: `{C9F06F80-14D5-11CE-AEF7-00AA00392F8A}`
+- **Class ID (CLSID)**: `{F13943F7-0B3A-4BD8-B429-B41750CE8FF3}`
 - **Threading Model**: Single-Thread Apartment (STA).
 
 ## Core Application Methods
 
 ### `Execute(command)`
-- **Signature**: `Execute(command: BSTR) -> long`
+- **Signature**: `Execute(command: BSTR) -> void` (returns COM `HRESULT` in C++ / `None` in Python `win32com`)
 - **Behavior**: Executes a single Igor command string (up to 2,500 bytes).
-- **Return Value**: `0` on success; non-zero error code on failure.
-- **Limitation**: Does not return command history, output text, or error message strings.
+- **Limitation**: Does not return Igor error codes, command history, output text, or error message strings.
 
-### `Execute2(flags, unused, command, timeout, unused, unused, unused)`
-- **Signature**: `Execute2(flags: long, unused: long, command: BSTR, timeout: long, unused: BSTR, unused: BSTR, unused: BSTR) -> (errorCode, errorMessage, history, results)`
+### `Execute2(flags, codePage, command, pErrorCode, errorMsg, history, results)`
+- **Signature**: `Execute2(flags: int, codePage: int, command: BSTR, pErrorCode: int* [out], errorMsg: BSTR* [out], history: BSTR* [out], results: BSTR* [out])` — in Python `win32com`, the four `[out]` parameters are returned as `(errorCode, errorMsg, history, results)`.
 - **Behavior**: Preferred high-performance execution method introduced in modern Igor Pro. Executes a command synchronously, returns detailed error codes and messages, and captures all generated console history output.
 - **Latency**: `< 5 ms` per call without disk I/O or temporary file creation.
 

@@ -32,7 +32,7 @@ Standard execution flags modify operation behavior across built-in Igor commands
 |---|---|---|
 | `/O` | Overwrite existing object without prompting or error | `Make/O/N=100 wave0`, `Duplicate/O w, w_copy`, `NewDataFolder/O/S root:Data` |
 | `/Q` | Quiet mode; suppresses console history output and interactive alerts | `CurveFit/Q`, `WaveStats/Q my_wave`, `LoadWave/Q` |
-| `/Z` | Zero/Quiet error mode; suppresses modal error dialogs and returns status | `KillWaves/Z temp_wave`, `CloseProc/Z`, `Execute/Z cmd` |
+| `/Z` | Zero/Quiet error mode; suppresses modal error dialogs and returns status | `KillWaves/Z temp_wave`, `Execute/Z cmd` |
 | `/D` | Display/Destination flag; plots fit curves or specifies destination waves | `CurveFit/Q sin, my_wave /D` |
 | `/N` | Size or count parameter; sets point count or dimension allocation | `Make/O/N=1000 my_wave`, `Make/O/N=(100, 100) mat` |
 | `/P` | Path or scaling parameter; sets wave X-scaling or folder path | `SetScale/P x 0, 1e-3, "s", w`, `LoadWave/P=myPath` |
@@ -63,7 +63,7 @@ Standard execution flags modify operation behavior across built-in Igor commands
 When driving Igor Pro via automation or MCP:
 - Always include `/O` on mutating creation commands (`Make/O`, `Duplicate/O`, `NewDataFolder/O`) to prevent modal overwrite prompts.
 - Always include `/Q` on analysis operations (`WaveStats/Q`, `CurveFit/Q`) to prevent dialogs and excessive history buffer growth.
-- Always include `/Z` on cleanup commands (`KillWaves/Z`, `CloseProc/Z`) so missing objects do not raise fatal errors.
+- Always include `/Z` on cleanup commands that support it (`KillWaves/Z`, `Execute/Z`) so missing objects do not raise fatal errors.
 - Never exceed 2,400 UTF-8 bytes per single command execution string.
 
 See also: [Wave Architecture](Igor-Pro-10-Wave-Architecture.md), [Curve Fitting](Igor-Pro-10-Curve-Fitting.md), [Automation and COM](Igor-Pro-10-Automation-and-COM.md), [Data Folders](Igor-Pro-10-Data-Folders.md)

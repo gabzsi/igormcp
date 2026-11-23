@@ -17,7 +17,7 @@ Curve fitting in Igor Pro uses the Levenberg-Marquardt non-linear least-squares 
 | Function Name | Model Equation | Fitted Coefficients (`W_coef`) |
 |---|---|---|
 | `line` | $y = k_0 + k_1 x$ | `W_coef[0]=y0`, `[1]=slope` |
-| `poly n` | $y = \sum_{i=0}^n k_i x^i$ | `W_coef[0...n]` |
+| `poly n` | $y = \sum_{i=0}^{n-1} k_i x^i$ ($n$ = number of terms, i.e. degree + 1) | `W_coef[0...n-1]` |
 | `sin` | $y = y_0 + A \sin(\omega x + \phi)$ | `W_coef[0]=y0`, `[1]=A`, `[2]=omega` (rad/s), `[3]=phi` |
 | `gauss` | $y = y_0 + A \exp(-((x - x_0) / \text{width})^2)$ | `W_coef[0]=y0`, `[1]=A`, `[2]=x0`, `[3]=width` |
 | `lor` | $y = y_0 + A / ((x - x_0)^2 + B)$ | `W_coef[0]=y0`, `[1]=A`, `[2]=x0`, `[3]=B` |
@@ -41,11 +41,11 @@ CurveFit/Q sin, yWave(0.002, 0.045) /D
 - `/Q`: Quiet mode; suppresses interactive fitting alerts and console printing.
 - `/D`: Destination / Display; automatically generates a high-resolution fitted wave named `fit_<yWave>` and adds it to the active graph.
 - `/X=xWave`: Specifies independent variable wave for non-uniformly spaced data.
-- `/W=weightWave`: Specifies error weights ($1/\sigma$ or $1/\sigma^2$).
-- `/M=0`: Standard non-matrix weighting mode.
-- `/M=2`: Matrix weighting mode; calculates and outputs the full parameter covariance matrix `M_Covar`.
+- `/W=weightWave`: Specifies error weights ($1/\sigma$ by default with `/I=0`, or $\sigma$ with `/I=1`).
+- `/M=0`: Disables covariance matrix generation.
+- `/M=2`: Generates and outputs the full 2D parameter covariance matrix `M_Covar` (`/M=1` creates legacy 1D waves `CM_Kn`).
 - `/H="<holdString>"`: Bitmask string indicating held parameters (`"1"` to hold, `"0"` to optimize, e.g. `/H="00010"`).
-- `/I=1`: Interprets `/W` weights as inverse standard deviation ($1/\sigma$).
+- `/I=1`: Interprets `/W` weights as standard deviations ($\sigma$); `/I=0` (default) interprets `/W` weights as reciprocal standard deviations ($1/\sigma$).
 
 ## Output Variables and Waves
 
@@ -54,10 +54,10 @@ A successful `CurveFit` or `FuncFit` operation creates or updates several object
 1. **`W_coef` (1D Wave)**: Contains optimized parameter values in standard order.
 2. **`W_sigma` (1D Wave)**: Contains estimated standard errors for each coefficient.
 3. **`M_Covar` (2D Wave)**: Full parameter covariance matrix (only generated when `/M=2` is specified). Inside compiled user functions, must be declared via `Wave M_Covar = M_Covar`.
-4. **`V_chisq` (Scalar Variable)**: Reduced Chi-Square ($\chi^2$) goodness of fit.
+4. **`V_chisq` (Scalar Variable)**: Unreduced Chi-Square ($\chi^2 = \sum ((y - y_i)/\sigma_i)^2$, or sum of squared residuals when unweighted). Reduced $\chi^2$ is `V_chisq / (V_npnts - numpnts(W_coef))`.
 5. **`V_npnts` (Scalar Variable)**: Number of data points included in the fit.
-6. **`V_fitError` (Scalar Variable)**: Error code (`0` = normal convergence; non-zero = singular matrix, max iterations exceeded, or math error).
-7. **`V_fitOptions` (Scalar Variable)**: Bitmask of options used during fitting.
+6. **`V_fitError` (I/O Scalar Variable)**: Create and set to `0` *before* fitting to suppress aborts on math errors (`0` = normal convergence; non-zero bitmask = singular matrix, math error, etc.).
+7. **`V_fitOptions` (Input Scalar Variable)**: Optional bitmask created by the user *before* fitting to control fit options (e.g., `4` suppresses the progress window).
 
 ## User-Defined Fit Functions
 

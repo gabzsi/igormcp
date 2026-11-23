@@ -733,6 +733,7 @@ class ValidationTests(unittest.TestCase):
             "list_windows",
             "get_experiment_info",
             "get_system_information",
+            "inspect_experiment",
         })
         self.assertTrue(tools["query_igor_help"].annotations.readOnlyHint)
         self.assertFalse(tools["query_igor_help"].annotations.destructiveHint)
@@ -767,6 +768,7 @@ class ValidationTests(unittest.TestCase):
             "list_windows",
             "get_experiment_info",
             "get_system_information",
+            "inspect_experiment",
         ):
             self.assertTrue(tools[name].annotations.readOnlyHint)
             self.assertFalse(tools[name].annotations.destructiveHint)
@@ -1883,8 +1885,8 @@ class HybridPipeAndNewToolsTests(unittest.TestCase):
         with patch.dict(os.environ, {"IGOR_TOOL_PROFILE": "core"}):
             core_names = asyncio.run(_list_names())
 
-        self.assertEqual(len(full_names), 33)
-        self.assertEqual(len(core_names), 30)
+        self.assertEqual(len(full_names), 34)
+        self.assertEqual(len(core_names), 31)
         for report_tool in ("create_html_report", "open_report_graph", "apply_html_report"):
             self.assertIn(report_tool, full_names)
             self.assertNotIn(report_tool, core_names)
@@ -2046,7 +2048,7 @@ class HybridPipeAndNewToolsTests(unittest.TestCase):
                 server.list_windows(match=bad_match)
 
     def test_quick_polish_server_info_version_and_call_function_schema_docs(self):
-        self.assertEqual(server.mcp._mcp_server.version, "0.3.0")
+        self.assertEqual(server.mcp._mcp_server.version, "0.4.0")
 
         async def _check_wire():
             async with create_connected_server_and_client_session(server.mcp) as client:
@@ -2055,7 +2057,7 @@ class HybridPipeAndNewToolsTests(unittest.TestCase):
                 return init, tools
 
         init_result, tools_result = asyncio.run(_check_wire())
-        self.assertEqual(init_result.serverInfo.version, "0.3.0")
+        self.assertEqual(init_result.serverInfo.version, "0.4.0")
 
         call_fn_tool = next(t for t in tools_result.tools if t.name == "call_function")
         args_desc = call_fn_tool.inputSchema["properties"]["args"]["description"]
@@ -2305,6 +2307,320 @@ class HybridPipeAndNewToolsTests(unittest.TestCase):
             self.assertFalse(closed_res["load_started"])
             self.assertTrue(closed_res["outcome_known"])
             self.assertIn("IGOR_TRANSPORT=pipe", closed_res["error"])
+
+    def test_inspect_experiment_pipe_path_and_truncation(self):
+        tree = {
+            "root:": {
+                "waves": [f"w{i}" for i in range(25)],
+                "vars": 2,
+                "strings": 1,
+                "subs": ["RunA", "RunB"],
+            },
+            "root:RunA:": {
+                "waves": ["signal", "fit_signal"],
+                "vars": 1,
+                "strings": 0,
+                "subs": ["Nested"],
+            },
+            "root:RunB:": {
+                "waves": ["baseline"],
+                "vars": 0,
+                "strings": 0,
+                "subs": [],
+            },
+            "root:RunA:Nested:": {
+                "waves": ["deepWave"],
+                "vars": 0,
+                "strings": 0,
+                "subs": [],
+            },
+        }
+        windows_by_bit = {
+            "WIN:1": "Graph0;Graph1;",
+            "WIN:2": "Table0;",
+            "WIN:4": "",
+            "WIN:16": "Notebook0;",
+            "WIN:64": "Panel0;",
+            "WIN:65536": "",
+        }
+
+        class _InspectPipeClient(_FakePipeClient):
+            def call_function(self, name, args=None, kwargs=None, timeout_seconds=30.0):
+                self.calls.append(("call_function", name, args, kwargs, timeout_seconds))
+                if name == "DataFolderExists":
+                    return {"type": "number", "value": 1 if args[0] in tree else 0}
+                if name == "IgorInfo":
+                    if args == [1]:
+                        return {"type": "string", "value": "LabExp"}
+                    if args == [12]:
+                        return {"type": "string", "value": "LabExp.pxp"}
+                if name == "CountObjects":
+                    node = tree[args[0]]
+                    obj_type = args[1]
+                    counts = {
+                        1: len(node["waves"]),
+                        2: node["vars"],
+                        3: node["strings"],
+                        4: len(node["subs"]),
+                    }
+                    return {"type": "number", "value": counts[obj_type]}
+                if name == "GetIndexedObjName":
+                    node = tree[args[0]]
+                    obj_type, idx = args[1], args[2]
+                    items = node["waves"] if obj_type == 1 else node["subs"]
+                    return {"type": "string", "value": items[idx]}
+                if name == "WinList":
+                    return {"type": "string", "value": windows_by_bit.get(args[2], "")}
+                return {"type": "string", "value": ""}
+
+            def execute_command(self, command, timeout_seconds=30.0):
+                self.calls.append(("execute_command", command, timeout_seconds))
+                if "PathInfo home" in command:
+                    return {"results": r"C:\Data\Experiments", "history": ""}
+                return {"results": "", "history": ""}
+
+        # Full inspection over pipe with root_folder normalized ("root" -> "root:")
+        fake = _InspectPipeClient()
+        with (
+            patch.object(server, "_try_pipe_client", return_value=fake),
+            patch.object(server, "_with_igor") as com_call,
+        ):
+            res = server.inspect_experiment(root_folder="root", max_depth=4, max_folders=50)
+
+        com_call.assert_not_called()
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["transport"], "pipe")
+        self.assertEqual(
+            res["experiment"],
+            {
+                "name": "LabExp",
+                "file_name": "LabExp.pxp",
+                "path": r"C:\Data\Experiments",
+                "saved": True,
+            },
+        )
+        self.assertEqual(res["root_folder"], "root:")
+        self.assertEqual(res["folder_count"], 4)
+        self.assertEqual(res["total_waves"], 29)
+        self.assertFalse(res["truncated"])
+        self.assertEqual(
+            [f["path"] for f in res["folders"]],
+            ["root:", "root:RunA:", "root:RunB:", "root:RunA:Nested:"],
+        )
+        # First folder had 25 waves -> capped at 20 with waves_truncated=True
+        self.assertEqual(len(res["folders"][0]["waves"]), 20)
+        self.assertTrue(res["folders"][0]["waves_truncated"])
+        self.assertEqual(res["folders"][1]["waves"], ["signal", "fit_signal"])
+        self.assertFalse(res["folders"][1]["waves_truncated"])
+        self.assertEqual(
+            res["windows"],
+            {
+                "graph": ["Graph0", "Graph1"],
+                "table": ["Table0"],
+                "layout": [],
+                "panel": ["Panel0"],
+                "notebook": ["Notebook0"],
+                "gizmo": [],
+            },
+        )
+        # Never calls SetDataFolder
+        exec_cmds = [c[1] for c in fake.calls if c[0] == "execute_command"]
+        self.assertFalse(any("SetDataFolder" in cmd for cmd in exec_cmds))
+
+        # max_depth=2 truncates root:RunA:Nested: (depth 2)
+        fake_depth = _InspectPipeClient()
+        with patch.object(server, "_try_pipe_client", return_value=fake_depth):
+            depth_res = server.inspect_experiment(max_depth=2, include_wave_names=False)
+        self.assertEqual(depth_res["folder_count"], 3)
+        self.assertTrue(depth_res["truncated"])
+        self.assertTrue(all(f["waves"] == [] and not f["waves_truncated"] for f in depth_res["folders"]))
+
+        # max_folders=2 truncates remaining folders
+        fake_max = _InspectPipeClient()
+        with patch.object(server, "_try_pipe_client", return_value=fake_max):
+            max_res = server.inspect_experiment(max_folders=2)
+        self.assertEqual(max_res["folder_count"], 2)
+        self.assertTrue(max_res["truncated"])
+
+        # Missing folder raises IgorError
+        fake_missing = _InspectPipeClient()
+        with patch.object(server, "_try_pipe_client", return_value=fake_missing):
+            with self.assertRaisesRegex(server.IgorError, "does not exist"):
+                server.inspect_experiment(root_folder="root:Nope:")
+
+        # Invalid root_folder syntax raises IgorError
+        with self.assertRaisesRegex(server.IgorError, "root:"):
+            server.inspect_experiment(root_folder="notroot:")
+        with self.assertRaisesRegex(server.IgorError, "empty path component"):
+            server.inspect_experiment(root_folder="root::bad:")
+
+    def test_inspect_experiment_com_fallback_and_pipe_fail_closed(self):
+        def fake_query(_app, _fmt, expr):
+            if expr == 'DataFolderExists("root:")':
+                return "1"
+            if expr == "IgorInfo(1)":
+                return "ComExp"
+            if expr == "IgorInfo(12)":
+                return ""
+            if 'CountObjects("root:", 1)' in expr:
+                return "2|1|0|1"
+            if 'CountObjects("root:Sub:", 1)' in expr:
+                return "1|0|0|0"
+            if expr == 'GetIndexedObjName("root:", 1, 0)':
+                return "w0"
+            if expr == 'GetIndexedObjName("root:", 1, 1)':
+                return "w1"
+            if expr == 'GetIndexedObjName("root:", 4, 0)':
+                return "Sub"
+            if expr == 'GetIndexedObjName("root:Sub:", 1, 0)':
+                return "subWave"
+            if expr == 'WinList("*", ";", "WIN:1")':
+                return "Graph0;"
+            if expr.startswith('WinList("*", ";", "WIN:'):
+                return ""
+            self.fail(f"Unexpected COM query: {expr}")
+
+        with (
+            patch.object(server, "_try_pipe_client", return_value=None),
+            patch.object(
+                server, "_with_igor", side_effect=lambda fn, **kw: fn(object(), 10.0)
+            ),
+            patch.object(server, "_query", side_effect=fake_query),
+        ):
+            res = server.inspect_experiment()
+
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["transport"], "com")
+        self.assertEqual(
+            res["experiment"],
+            {"name": "ComExp", "file_name": "", "path": "", "saved": False},
+        )
+        self.assertEqual(res["folder_count"], 2)
+        self.assertEqual(res["total_waves"], 3)
+        self.assertFalse(res["truncated"])
+        self.assertEqual(res["folders"][0]["waves"], ["w0", "w1"])
+        self.assertEqual(res["folders"][1]["path"], "root:Sub:")
+        self.assertEqual(res["folders"][1]["waves"], ["subWave"])
+        self.assertEqual(res["windows"]["graph"], ["Graph0"])
+        self.assertEqual(set(res["windows"]), {"graph", "table", "layout", "panel", "notebook", "gizmo"})
+
+        # IGOR_TRANSPORT=pipe fails closed without COM fallback
+        with (
+            patch.dict(os.environ, {"IGOR_TRANSPORT": "pipe"}),
+            patch.object(server, "_try_pipe_client", return_value=None),
+            patch.object(server, "_with_igor") as com_call_closed,
+        ):
+            with self.assertRaisesRegex(server.IgorError, "IGOR_TRANSPORT=pipe"):
+                server.inspect_experiment()
+        com_call_closed.assert_not_called()
+
+    def test_progress_heartbeat_emitted_over_real_mcp_session(self):
+        progress_events: list[tuple[float, float | None, str | None]] = []
+
+        async def _progress_cb(
+            progress: float, total: float | None, message: str | None
+        ) -> None:
+            progress_events.append((progress, total, message))
+
+        def _slow_execute(_command, timeout_seconds=None):
+            server.time.sleep(0.18)
+            return {
+                "ok": True,
+                "output": "done",
+                "error": None,
+                "warning": None,
+                "command_started": True,
+                "command_completed": True,
+                "outcome_known": True,
+                "preexisting_dialog_count": 0,
+                "dialog_detected": False,
+                "dialogs_open": 0,
+                "dialog_titles": [],
+                "dialog_details": [],
+                "compilation_errors": [],
+                "history": "done",
+                "results": "",
+                "elapsed_seconds": 0.18,
+                "transport": "pipe",
+            }
+
+        async def _run_slow():
+            async with create_connected_server_and_client_session(
+                server.mcp._mcp_server
+            ) as session:
+                return await session.call_tool(
+                    "execute_igor",
+                    {"command": "Print 1"},
+                    progress_callback=_progress_cb,
+                )
+
+        with (
+            patch.object(server, "_PROGRESS_HEARTBEAT_INITIAL_DELAY_SECONDS", 0.04),
+            patch.object(server, "_PROGRESS_HEARTBEAT_INTERVAL_SECONDS", 0.04),
+            patch.object(server, "_execute_igor_in_worker", side_effect=_slow_execute),
+            patch.object(server, "_record_tool_call_best_effort"),
+        ):
+            result = asyncio.run(_run_slow())
+
+        self.assertFalse(result.isError)
+        self.assertTrue(result.structuredContent["ok"])
+        self.assertGreaterEqual(len(progress_events), 2)
+        for progress, total, message in progress_events:
+            self.assertGreater(progress, 0.0)
+            self.assertIsNone(total)
+            self.assertIn("execute_igor running", message or "")
+        self.assertGreater(progress_events[-1][0], progress_events[0][0])
+
+        # Fast tool call (< initial delay) emits zero heartbeats
+        fast_events: list[tuple[float, float | None, str | None]] = []
+
+        async def _fast_cb(
+            progress: float, total: float | None, message: str | None
+        ) -> None:
+            fast_events.append((progress, total, message))
+
+        async def _run_fast():
+            async with create_connected_server_and_client_session(
+                server.mcp._mcp_server
+            ) as session:
+                return await session.call_tool(
+                    "execute_igor",
+                    {"command": "Print 1"},
+                    progress_callback=_fast_cb,
+                )
+
+        with (
+            patch.object(server, "_PROGRESS_HEARTBEAT_INITIAL_DELAY_SECONDS", 5.0),
+            patch.object(server, "_PROGRESS_HEARTBEAT_INTERVAL_SECONDS", 5.0),
+            patch.object(
+                server,
+                "_execute_igor_in_worker",
+                return_value={
+                    "ok": True,
+                    "output": "fast",
+                    "error": None,
+                    "warning": None,
+                    "command_started": True,
+                    "command_completed": True,
+                    "outcome_known": True,
+                    "preexisting_dialog_count": 0,
+                    "dialog_detected": False,
+                    "dialogs_open": 0,
+                    "dialog_titles": [],
+                    "dialog_details": [],
+                    "compilation_errors": [],
+                    "history": "fast",
+                    "results": "",
+                    "elapsed_seconds": 0.001,
+                    "transport": "pipe",
+                },
+            ),
+            patch.object(server, "_record_tool_call_best_effort"),
+        ):
+            fast_result = asyncio.run(_run_fast())
+
+        self.assertFalse(fast_result.isError)
+        self.assertEqual(fast_events, [])
 
 
 if __name__ == "__main__":

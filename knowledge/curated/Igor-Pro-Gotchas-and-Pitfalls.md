@@ -125,7 +125,7 @@ When authoring `.ipf` procedures that must compile on both Igor Pro 10 and legac
 
 ## 12. Font-Escape Syntax in Graph Labels (`\F'Symbol'`) vs. Native UTF-8
 
-- **The Pitfall**: Legacy Igor Pro procedures frequently used font-switching escape codes like `\F'Symbol'm\Fs` to print Greek letters like $\mu\text{s}$. However, in Igor Pro, `\Fs` is an **invalid escape code** (returning to the default font requires `\F0` or `\M`). When Igor encounters `\Fs`, the font switch never closes, leaving all subsequent characters rendered in Symbol font. For example, `s` is rendered as Greek $\sigma$ and `)` remains in Symbol font, corrupting axis labels into unreadable glyphs.
+- **The Pitfall**: Legacy Igor Pro procedures frequently used font-switching escape codes like `\F'Symbol'm\Fs` to print Greek letters like $\mu\text{s}$. However, in Igor Pro, `\Fs` is an **invalid escape code** (returning to the default font requires `\F]0` or `\F'<fontName>'`; `\M` only restores main font size and baseline, not the font). When Igor encounters `\Fs`, the font switch never closes, leaving all subsequent characters rendered in Symbol font. For example, `s` is rendered as Greek $\sigma$ and `)` remains in Symbol font, corrupting axis labels into unreadable glyphs.
 - **Impact**: Microsecond axes (`µs`) and standard deviation labels (`σ`) appear severely mangled in GUI graphs and publication exports.
 - **The Solution**: In modern Igor Pro (Igor 7 through 10), native UTF-8 encoding is fully supported. Avoid escape-code font switching entirely and pass standard UTF-8 string literals directly:
   ```text

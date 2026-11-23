@@ -20,7 +20,7 @@
       "path": "curated/Igor-Pro-10-Automation-and-COM.md",
       "collection": "guides",
       "title": "Igor-Pro-10-Automation-and-COM",
-      "bundle_sha256": "D46FAE7B0BC9C417EE8FDE0F6C08E229DE536754F4FCEB4A71D85E451A5A5FD6",
+      "bundle_sha256": "4DB861B5BAD8FCBD619429D8DA694C109A69CAC83F2CF9444D44348C232FF70E",
       "provenance": "Project-authored technical guide; consult WaveMetrics documentation for authoritative product details."
     },
     {
@@ -28,7 +28,7 @@
       "path": "curated/Igor-Pro-10-Curve-Fitting.md",
       "collection": "guides",
       "title": "Igor-Pro-10-Curve-Fitting",
-      "bundle_sha256": "DA19D50C1D0DA1507C7DAD475C21B435F4B5DF25EDAD19050B3B2C5E5CA33D5F",
+      "bundle_sha256": "2F46164B789139CCA823C7348988255618BB53ADEEFDC76A208276E9C8A810D6",
       "provenance": "Project-authored technical guide; consult WaveMetrics documentation for authoritative product details."
     },
     {
@@ -44,7 +44,7 @@
       "path": "curated/Igor-Pro-10-Syntax-and-Commands.md",
       "collection": "guides",
       "title": "Igor-Pro-10-Syntax-and-Commands",
-      "bundle_sha256": "C0079BEAC4AF806F73F5388F55AFA24E6591AA64FCA2589D103BF1120D2C7597",
+      "bundle_sha256": "F1FC81422313D88C52F317E32AB6DDDA67C48248E85E237999F064752853F42B",
       "provenance": "Project-authored technical guide; consult WaveMetrics documentation for authoritative product details."
     },
     {
@@ -52,7 +52,7 @@
       "path": "curated/Igor-Pro-10-Wave-Architecture.md",
       "collection": "guides",
       "title": "Igor-Pro-10-Wave-Architecture",
-      "bundle_sha256": "17BA14520DB6C76B0B4E1827E6B6F419400B5B63735379284506F423BBBC0C91",
+      "bundle_sha256": "6B6C64D894FA9AB4298D57FA643FF16A2201A48A0B2EE20AD1019612852BE00E",
       "provenance": "Project-authored technical guide; consult WaveMetrics documentation for authoritative product details."
     },
     {
@@ -60,7 +60,7 @@
       "path": "curated/Igor-Pro-Figure-Making-and-Publication-Styling.md",
       "collection": "guides",
       "title": "Igor-Pro-Figure-Making-and-Publication-Styling",
-      "bundle_sha256": "190A53366FE0D4EE4FA284634994251712ABF7EE2A9F0E7BA0D7268C9164350B",
+      "bundle_sha256": "968D6C4F63DAEB8EBAA73E200CB6827D923BDA2E4D739208A1332B40AA075C31",
       "provenance": "Project-authored technical guide; consult WaveMetrics documentation for authoritative product details."
     },
     {
@@ -68,7 +68,7 @@
       "path": "curated/Igor-Pro-Gotchas-and-Pitfalls.md",
       "collection": "guides",
       "title": "Igor-Pro-Gotchas-and-Pitfalls",
-      "bundle_sha256": "D466B5BB4DEE7E83D2F604343321F67F1A6AC84C423556E371ECB55CD297C7C0",
+      "bundle_sha256": "1F7475574EAB0180783EE995BD78E2DA2929B464847267806F2491A08BE666F6",
       "provenance": "Project-authored technical guide; consult WaveMetrics documentation for authoritative product details."
     },
     {
@@ -76,7 +76,7 @@
       "path": "curated/Python-NumPy-to-Igor-Pro-Rosetta-Stone.md",
       "collection": "guides",
       "title": "Python-NumPy-to-Igor-Pro-Rosetta-Stone",
-      "bundle_sha256": "AEB03CFE8ECA4CF6548255AE1D845984A909E9D8949D33BA4F527B390DFCE7D2",
+      "bundle_sha256": "BDC756C0EE88CCFF70E882DE8F2086898742FF25E53A15D4E0E12D94FA278B36",
       "provenance": "Project-authored technical guide; consult WaveMetrics documentation for authoritative product details."
     }
   ]

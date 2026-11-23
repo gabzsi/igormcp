@@ -87,9 +87,8 @@ High-impact, subdued academic palette.
 ModifyGraph mode(rawData)=3, marker(rawData)=19, msize(rawData)=2.5
 ModifyGraph mode(fitData)=0, lsize(fitData)=1.5, lstyle(fitData)=0
 
-// Add symmetric error bars from standard error wave
-ErrorBars rawData Y, wave=(sigmaWave, sigmaWave)
-ModifyGraph errBox=0, barThick=1.0
+// Add symmetric error bars from standard error wave (/L=line thickness, /T=cap thickness)
+ErrorBars/L=1.0/T=1.0 rawData Y, wave=(sigmaWave, sigmaWave)
 ```
 
 - **Modes (`mode(w)=...`)**:
@@ -98,16 +97,16 @@ ModifyGraph errBox=0, barThick=1.0
   - `4`: Line and markers.
 - **Markers (`marker(w)=...`)**:
   - `19`: Filled circle.
-  - `8`: Filled square.
-  - `16`: Open circle.
-  - `5`: Plus/cross.
+  - `16`: Filled square.
+  - `8`: Open circle.
+  - `5`: Open square (`0` = plus `+`, `1` = cross `×`).
 
 ## 5. Axis Labels, Math Typography, and Legends
 
 Igor Pro uses backslash escape codes for formatting axis labels and text boxes:
 - Superscript: `\Stext\M`
 - Subscript: `\Btext\M`
-- Greek letters: `\Z08` or native unicode `\u03BC` ($\mu$), `\u03C4` ($\tau$), `\u03BB` ($\lambda$)
+- Greek letters: native UTF-8 characters or Unicode escape sequences `\u03BC` ($\mu$), `\u03C4` ($\tau$), `\u03BB` ($\lambda$) (note: `\Znn` sets font size in points, not Greek letters)
 
 ```text
 // Chemical and physical units formatting:
@@ -122,21 +121,21 @@ Export figures directly without GUI dialogs using `SavePICT`:
 
 ```text
 // 1. High-Resolution 300 DPI PNG (for manuscripts & slides)
-SavePICT/E=-5/B=300 as "C:\\Users\\...\\Figure1.png"
+SavePICT/E=-5/RES=300 as "C:\\Users\\...\\Figure1.png"
 
 // 2. Ultra-High Resolution 600 DPI TIFF (for final print submission)
-SavePICT/E=-7/B=600 as "C:\\Users\\...\\Figure1.tif"
+SavePICT/E=-7/RES=600 as "C:\\Users\\...\\Figure1.tif"
 
 // 3. Vector PDF (resolution-independent; native text & paths preserved)
-SavePICT/E=-2 as "C:\\Users\\...\\Figure1.pdf"
+SavePICT/E=-8 as "C:\\Users\\...\\Figure1.pdf"
 ```
 
 | Flag | Description |
 |---|---|
 | `/E=-5` | PNG format (lossless compression). |
-| `/E=-7` | TIFF format (uncompressed print master). |
-| `/E=-2` | Vector PDF format. |
-| `/B=dpi`| Raster bitmap resolution (e.g. `/B=300` or `/B=600`). |
+| `/E=-7` | TIFF format (lossless print master). |
+| `/E=-8` | Vector PDF format (`/E=-2` is Windows Enhanced Metafile EMF). |
+| `/RES=dpi` | Exact raster output resolution in DPI (e.g. `/RES=300` or `/RES=600`; `/B=dpi` only accepts `n*72` for `n=1..8`). |
 
 ## 7. Reusable Procedure Module
 

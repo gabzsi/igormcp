@@ -18,9 +18,9 @@ Waves are the fundamental data structures in WaveMetrics Igor Pro, representing 
 In Igor Pro 10, a wave consists of:
 - **Data payload**: An array of 1D, 2D, 3D, or 4D points.
 - **Data type**:
-  - Double-precision floating point (default with `/D` flag, standard in modern Igor).
-  - Single-precision floating point (`/S`).
-  - Signed or unsigned integer (8, 16, 32, or 64 bits: `/B`, `/W`, `/I`, `/L`).
+  - Single-precision floating point (32-bit; default when no type flag is specified on `Make`).
+  - Double-precision floating point (64-bit; requires `/D` flag on `Make`).
+  - Signed or unsigned integer (8, 16, 32, or 64 bits: `/B`, `/W`, `/I`, `/L`; add `/U` for unsigned).
   - Text wave (`/T` flag).
   - Complex numeric wave (`/C` flag).
 - **Dimension scaling**: Intrinsic mapping from point indices ($p, q, r, s$) to physical coordinates ($x, y, z, t$).
@@ -29,8 +29,8 @@ In Igor Pro 10, a wave consists of:
 ## Wave Creation and Allocation
 
 ```text
-Make/O/N=1000 my_wave                    // 1D wave of 1000 double points
-Make/O/D/N=500 precision_wave            // Explicit double precision
+Make/O/N=1000 my_wave                    // 1D wave of 1000 single-precision float points (default)
+Make/O/D/N=500 precision_wave            // Explicit double precision (64-bit float)
 Make/O/T/N=50 labels                     // 1D text wave with 50 elements
 Make/O/N=(100, 200) image_matrix         // 2D wave: 100 rows by 200 columns
 ```
