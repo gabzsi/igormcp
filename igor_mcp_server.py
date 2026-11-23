@@ -4085,7 +4085,10 @@ def create_html_report(
                 "source_experiment": source, "figures": [_report_graph(app, version, graph) for graph in graphs]}
         if editing_mode == "igor":
             import igor_report_links
-            data["igor_executable"] = str(_igor_executable_candidates()[0])
+            candidates = _igor_executable_candidates()
+            data["igor_executable"] = (
+                str(candidates[0]) if candidates else str(_DEFAULT_IGOR_EXECUTABLE)
+            )
             def export_graph(graph, destination):
                 _execute_command(app, f"GetWindow {graph} hide")
                 was_hidden = _query(app, "%d", "V_value").strip() == "1"
@@ -4220,14 +4223,23 @@ def open_report_graph(
     path = path.resolve()
 
     def operation(app, _version):
-        if os.path.normcase(_report_source(app)) != os.path.normcase(str(path)):
+        def _same_source() -> bool:
+            current = _report_source(app)
+            if not current:
+                return False
+            try:
+                return os.path.normcase(str(Path(current).resolve())) == os.path.normcase(str(path))
+            except OSError:
+                return os.path.normcase(current) == os.path.normcase(str(path))
+
+        if not _same_source():
             app.LoadExperiment(_IGOR_LOAD_EXPERIMENT_FLAGS, _IGOR_LOAD_TYPE_OPEN, "", str(path))
             dialogs = _igor_dialogs()
             if dialogs:
                 if activate:
                     _activate_report_window(_query(app, "%s", "IgorInfo(1)").strip())
                 raise IgorError(_dialog_blocking_message(dialogs, "opening the linked experiment"))
-            if os.path.normcase(_report_source(app)) != os.path.normcase(str(path)):
+            if not _same_source():
                 raise IgorError("The linked experiment has not opened. Inspect Igor before retrying.")
         if _query(app, "%d", f'WinType("{graph}")').strip() != "1":
             raise IgorError(f"Graph '{graph}' is not present in the linked experiment")

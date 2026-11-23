@@ -39,7 +39,7 @@ class NativeLinkTests(unittest.TestCase):
             with patch.object(links, "REGISTRY", root / "registry"):
                 token = links.register_report(output, data)
                 entry = json.loads((root / "registry" / (token + ".json")).read_text())
-                self.assertEqual(entry["path"], str(output))
+                self.assertEqual(entry["path"], str(output.resolve()))
                 with self.assertRaises(FileExistsError):
                     links.register_report(output, data)
                 self.assertEqual(len(list((root / "registry").glob("*.json"))), 1)

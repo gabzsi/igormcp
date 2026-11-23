@@ -21,7 +21,7 @@ class SessionTests(unittest.TestCase):
                 first = capture_markdown_session("../../sample", "Measured result", source_path=__file__)
                 second = capture_markdown_session("../../sample", "Other result", source_path=__file__)
             self.assertNotEqual(first["path"], second["path"])
-            self.assertEqual(Path(first["path"]).parent, Path(directory))
+            self.assertEqual(Path(first["path"]).parent, Path(directory).resolve())
             text = Path(first["path"]).read_text(encoding="utf-8")
             self.assertIn("Measured result", text)
             self.assertIn("caller-supplied human/assistant summary", text)
