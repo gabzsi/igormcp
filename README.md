@@ -7,7 +7,7 @@ Uses **native JSON-RPC named pipes** on Igor Pro 10.04+ (no COM required) with a
 
 * **Learns Your Lab's Workflow Over Time:**
   * **From existing `.pxp` files (`profile_workflow`):** Ask *"understand my workflow"* and it reads your folder structure, `.ipf` / instrument-control procedures, custom menus, loaded XOPs, and graph house style (`WinRecreation`)—then **incrementally merges** new experiments into a growing local profile (`save_profile=True`).
-  * **From your sessions (`capture_session` + `search_session_memory`):** Automatically logs tool runs locally (redacted, no bulk wave arrays) and lets you save analysis recipes, fit settings, and workarounds so future sessions pick up right where you left off instead of re-explaining your lab's conventions.
+  * **From your sessions (`capture_session` + `search_session_memory`):** Automatically logs tool runs locally (redacted, no bulk wave arrays) and lets you save analysis steps, fit settings, and workarounds so future sessions pick up right where you left off instead of re-explaining your lab's conventions.
 * **Analyze & Fit:** Run commands (`execute_igor`), call Igor functions with typed JSON args/returns (`call_function`), import CSV/TSV/TXT, and read 1D/2D numeric or 1D text waves with pagination (`get_wave_data`).
 * **See & Fix Plots:** Capture graphs, panels, tables, layouts, or Gizmos as PNGs (`capture_window`) so the AI can visually catch clipped labels, overlaps, or wrong colors.
 * **Develop `.ipf` Procedures:** Read embedded `Procedure` or `.ipf` windows (`read_procedure`), hot-reload edits silently from disk (`compile_procedures`), and inspect structured file/line compile errors.
@@ -18,7 +18,7 @@ Uses **native JSON-RPC named pipes** on Igor Pro 10.04+ (no COM required) with a
 ## Example Prompts
 
 * *"Understand my workflow from this `.pxp` and save my lab's procedures and plotting style under `my-lab`."*
-* *"Remember this fitting recipe and baseline workaround for next time."* (`capture_session`)
+* *"Save these fit constraints and baseline settings to session memory for next time."* (`capture_session`)
 * *"Check our past sessions for how we aligned and fitted the kinetics traces, then run it on `root:Run02`."* (`search_session_memory`)
 * *"Import `run01.csv` into `root:Exp1:`, fit a Gaussian, plot in ACS single-column width with inward ticks, and capture the graph to check formatting."*
 * *"Read `MyAnalysis.ipf`, add a baseline subtraction function, compile, and test it on `root:w_raw`."*
@@ -28,6 +28,12 @@ Uses **native JSON-RPC named pipes** on Igor Pro 10.04+ (no COM required) with a
 ## Installation
 
 **Requirements:** Windows, Python 3.10+, Igor Pro 6.0+ (10.04+ recommended).
+
+**No Python yet?** Install it in one command (then open a new PowerShell window):
+```powershell
+winget install Python.Python.3.12
+```
+*(Or download from [python.org](https://www.python.org/downloads/) with "Add Python to PATH" checked. If Python is already installed elsewhere, pass `.\setup.ps1 -Python 'C:\path\to\python.exe'`.)*
 
 ```powershell
 git clone https://github.com/gabzsi/igormcp.git
