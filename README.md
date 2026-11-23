@@ -5,9 +5,11 @@ Uses **native JSON-RPC named pipes** on Igor Pro 10.04+ (no COM required) with a
 
 ## What It Can Do
 
+* **Learns Your Lab's Workflow Over Time:**
+  * **From existing `.pxp` files (`profile_workflow`):** Ask *"understand my workflow"* and it reads your folder structure, `.ipf` / instrument-control procedures, custom menus, loaded XOPs, and graph house style (`WinRecreation`)—then **incrementally merges** new experiments into a growing local profile (`save_profile=True`).
+  * **From your sessions (`capture_session` + `search_session_memory`):** Automatically logs tool runs locally (redacted, no bulk wave arrays) and lets you save analysis recipes, fit settings, and workarounds so future sessions pick up right where you left off instead of re-explaining your lab's conventions.
 * **Analyze & Fit:** Run commands (`execute_igor`), call Igor functions with typed JSON args/returns (`call_function`), import CSV/TSV/TXT, and read 1D/2D numeric or 1D text waves with pagination (`get_wave_data`).
 * **See & Fix Plots:** Capture graphs, panels, tables, layouts, or Gizmos as PNGs (`capture_window`) so the AI can visually catch clipped labels, overlaps, or wrong colors.
-* **Learn Your Lab's Workflow:** Ask *"understand my workflow"* (`profile_workflow`) to extract your folder layout, `.ipf` / instrument-control procedures, custom menus, loaded XOPs, and graph styling defaults (`WinRecreation`)—and incrementally build a local profile across `.pxp` files with `save_profile=True`.
 * **Develop `.ipf` Procedures:** Read embedded `Procedure` or `.ipf` windows (`read_procedure`), hot-reload edits silently from disk (`compile_procedures`), and inspect structured file/line compile errors.
 * **Offline Docs & Curated Guides:** 8 audited Igor guides + local WaveMetrics Markdown cache (~10 MB RAM, ~15 ms search, zero web calls during work).
 * **Editable HTML Reports (Igor 9+):** Export graphs to linked single-figure `.pxp` editors or a self-contained offline browser editor (`create_html_report`, `apply_html_report`).
@@ -15,8 +17,9 @@ Uses **native JSON-RPC named pipes** on Igor Pro 10.04+ (no COM required) with a
 
 ## Example Prompts
 
-* *"Connect to Igor Pro and inspect this experiment's folders, waves, and open windows."*
-* *"Understand my workflow and save my lab's plotting style under profile `my-lab`."*
+* *"Understand my workflow from this `.pxp` and save my lab's procedures and plotting style under `my-lab`."*
+* *"Remember this fitting recipe and baseline workaround for next time."* (`capture_session`)
+* *"Check our past sessions for how we aligned and fitted the kinetics traces, then run it on `root:Run02`."* (`search_session_memory`)
 * *"Import `run01.csv` into `root:Exp1:`, fit a Gaussian, plot in ACS single-column width with inward ticks, and capture the graph to check formatting."*
 * *"Read `MyAnalysis.ipf`, add a baseline subtraction function, compile, and test it on `root:w_raw`."*
 
