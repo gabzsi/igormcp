@@ -1637,7 +1637,7 @@ class HybridPipeAndNewToolsTests(unittest.TestCase):
             patch.object(server, "_igor_dialogs", return_value=[dialog]),
             patch.object(server, "_capture_compilation_errors", return_value=[]),
         ):
-            with server._lock, server._command_worker_lock:
+            with server._lock, server._command_worker_lock, server._pipe_pool_lock:
                 abort_res = server.abort_igor(timeout_seconds=5.0)
                 state_res = server.get_igor_state()
 
@@ -2128,6 +2128,7 @@ class HybridPipeAndNewToolsTests(unittest.TestCase):
                 "dimensions": 1,
                 "wave_type_code": 4,
                 "complex": False,
+                "start": 0,
                 "truncated": False,
                 "values": [1.5, "NaN", "Inf"],
             },
@@ -2157,6 +2158,7 @@ class HybridPipeAndNewToolsTests(unittest.TestCase):
                 "y_units": "m",
                 "wave_type_code": 4,
                 "complex": False,
+                "start": 0,
                 "truncated": False,
                 "values": [[1.0, 2.0], [3.0, 4.0]],
             },
@@ -2621,6 +2623,409 @@ class HybridPipeAndNewToolsTests(unittest.TestCase):
 
         self.assertFalse(fast_result.isError)
         self.assertEqual(fast_events, [])
+
+
+class PersistentPipePoolTests(unittest.TestCase):
+    def setUp(self):
+        server._reset_pipe_pool()
+
+    def tearDown(self):
+        server._reset_pipe_pool()
+
+    def _make_poolable_client_cls(self, instances_out: list):
+        class _PoolablePipeClient(_FakePipeClient):
+            def __init__(self, *args, **kwargs):
+                super().__init__()
+                self._connected = False
+                self.connect_calls = 0
+                self.pid = 4242
+                instances_out.append(self)
+
+            @property
+            def is_connected(self) -> bool:
+                return self._connected and not self.closed
+
+            def connect(self, timeout_seconds=None):
+                self.connect_calls += 1
+                self._connected = True
+
+            def close(self) -> None:
+                self._connected = False
+                super().close()
+
+        return _PoolablePipeClient
+
+    def test_persistent_pipe_reused_across_consecutive_calls_and_reset(self):
+        created: list = []
+        client_cls = self._make_poolable_client_cls(created)
+
+        def _factory(*args, **kwargs):
+            inst = client_cls(*args, **kwargs)
+            inst.responses["call_function"] = lambda p: (
+                {"type": "string", "value": "Graph0;"}
+                if p["name"] == "WinList"
+                else {"type": "string", "value": "MyExp" if p["args"] == [1] else ""}
+            )
+            return inst
+
+        with (
+            patch.object(server.igor_pipe, "IgorPipeClient", side_effect=_factory),
+            patch.object(server.igor_pipe, "is_pid_alive", return_value=True),
+        ):
+            r1 = server.list_windows()
+            r2 = server.get_experiment_info()
+
+        self.assertEqual(r1["windows"], ["Graph0"])
+        self.assertEqual(r2["name"], "MyExp")
+        self.assertEqual(len(created), 1)
+        self.assertEqual(created[0].connect_calls, 1)
+        self.assertFalse(created[0].closed)
+        self.assertTrue(created[0].is_connected)
+
+        server._reset_pipe_pool()
+        self.assertTrue(created[0].closed)
+
+    def test_stale_pooled_pipe_reconnects_once_on_pre_dispatch_error(self):
+        created: list = []
+        client_cls = self._make_poolable_client_cls(created)
+
+        def _factory(*args, **kwargs):
+            inst = client_cls(*args, **kwargs)
+            inst.responses["call_function"] = {"type": "string", "value": "Graph0;"}
+            return inst
+
+        with (
+            patch.object(server.igor_pipe, "IgorPipeClient", side_effect=_factory),
+            patch.object(server.igor_pipe, "is_pid_alive", return_value=True),
+        ):
+            r1 = server.list_windows()
+            self.assertEqual(r1["windows"], ["Graph0"])
+            self.assertEqual(len(created), 1)
+
+            # Simulate Igor restarting so the cached handle breaks before bytes are sent.
+            created[0].responses["call_function"] = server.igor_pipe.PipeNotAvailableError(
+                "broken pipe pre-dispatch"
+            )
+            r2 = server.list_windows()
+
+        self.assertEqual(r2["windows"], ["Graph0"])
+        self.assertEqual(len(created), 2)
+        self.assertTrue(created[0].closed)
+        self.assertFalse(created[1].closed)
+
+    def test_stale_pid_detected_on_checkout_triggers_clean_reconnect(self):
+        created: list = []
+        client_cls = self._make_poolable_client_cls(created)
+
+        def _factory(*args, **kwargs):
+            inst = client_cls(*args, **kwargs)
+            inst.responses["call_function"] = {"type": "string", "value": "Graph0;"}
+            return inst
+
+        alive_state = {"alive": True}
+        with (
+            patch.object(server.igor_pipe, "IgorPipeClient", side_effect=_factory),
+            patch.object(
+                server.igor_pipe,
+                "is_pid_alive",
+                side_effect=lambda _pid: alive_state["alive"],
+            ),
+        ):
+            server.list_windows()
+            self.assertEqual(len(created), 1)
+            alive_state["alive"] = False
+            server.list_windows()
+
+        self.assertEqual(len(created), 2)
+        self.assertTrue(created[0].closed)
+        self.assertFalse(created[1].closed)
+
+    def test_post_dispatch_error_discards_pooled_client_without_replay(self):
+        created: list = []
+        client_cls = self._make_poolable_client_cls(created)
+
+        def _factory(*args, **kwargs):
+            inst = client_cls(*args, **kwargs)
+            inst.responses["call_function"] = {"type": "string", "value": "Graph0;"}
+            return inst
+
+        with (
+            patch.object(server.igor_pipe, "IgorPipeClient", side_effect=_factory),
+            patch.object(server.igor_pipe, "is_pid_alive", return_value=True),
+            patch.object(server, "_igor_dialogs", return_value=[]),
+            patch.object(server, "_capture_compilation_errors", return_value=[]),
+            patch.object(server, "_watch_for_igor_dialogs"),
+            patch.object(server, "_with_igor") as com_call,
+        ):
+            # Warm the pool.
+            server.list_windows()
+            self.assertEqual(len(created), 1)
+
+            # Simulate a post-dispatch timeout on the pooled client.
+            created[0].responses["execute_command"] = server.igor_pipe.PipeTimeoutError(
+                "timed out after dispatch"
+            )
+            res = server.execute_igor("Display w0")
+
+        com_call.assert_not_called()
+        self.assertFalse(res["ok"])
+        self.assertTrue(res["command_started"])
+        self.assertFalse(res["outcome_known"])
+        self.assertTrue(created[0].closed)
+        # Must NEVER reconnect/replay after a post-dispatch error.
+        self.assertEqual(len(created), 1)
+        self.assertIsNone(server._pipe_pool._client)
+
+
+class WavePaginationAndTextWaveTests(unittest.TestCase):
+    def setUp(self):
+        server._reset_pipe_pool()
+
+    def tearDown(self):
+        server._reset_pipe_pool()
+
+    def test_get_wave_data_rejects_negative_or_non_int_start(self):
+        with self.assertRaisesRegex(server.IgorError, "non-negative integer"):
+            server.get_wave_data("root:w0", start=-1)
+        with self.assertRaisesRegex(server.IgorError, "non-negative integer"):
+            server.get_wave_data("root:w0", start=True)
+
+    def test_get_wave_data_1d_and_2d_numeric_pagination_pipe(self):
+        class _PaginatedPipeClient(_FakePipeClient):
+            def __init__(self, kind: str):
+                super().__init__()
+                self.kind = kind
+                self.last_command = ""
+
+            def call_function(self, name, args=None, kwargs=None, timeout_seconds=30.0):
+                self.calls.append(("call_function", name, args))
+                if name == "WaveExists":
+                    return {"type": "number", "value": 1}
+                if name == "WaveType":
+                    if args and len(args) > 1 and args[1] == 1:
+                        return {"type": "number", "value": 1}
+                    return {"type": "number", "value": 4}
+                if name == "numpnts":
+                    return {"type": "number", "value": 6 if self.kind == "2d" else 5}
+                if name == "WaveDims":
+                    return {"type": "number", "value": 2 if self.kind == "2d" else 1}
+                if name == "DimSize":
+                    return {"type": "number", "value": 3 if args[1] == 0 else 2}
+                if name in ("DimOffset", "DimDelta"):
+                    return {"type": "number", "value": 0.0 if name == "DimOffset" else 1.0}
+                if name == "WaveUnits":
+                    return {"type": "string", "value": ""}
+                return {"type": "number", "value": 0}
+
+            def execute_command(self, command, timeout_seconds=30.0):
+                self.last_command = command
+                self.calls.append(("execute_command", command))
+                m_range = server.re.search(r"/R=\[(\d+),(\d+)\]", command)
+                first_row, last_row = int(m_range.group(1)), int(m_range.group(2))
+                if self.kind == "1d":
+                    data = [10.0, 20.0, 30.0, 40.0, 50.0]
+                    payload = "\n".join(str(v) for v in data[first_row : last_row + 1]) + "\n"
+                else:
+                    rows = [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]]
+                    payload = (
+                        "\n".join(
+                            "\t".join(str(v) for v in row)
+                            for row in rows[first_row : last_row + 1]
+                        )
+                        + "\n"
+                    )
+                m_out = server.re.search(r'Open \S+ as "([^"]+)"', command)
+                if m_out:
+                    Path(m_out.group(1).replace("\\\\", "\\")).write_text(
+                        payload, encoding="utf-8"
+                    )
+                return {"results": "", "history": ""}
+
+        c1 = _PaginatedPipeClient("1d")
+        with patch.object(server, "_try_pipe_client", return_value=c1):
+            p1 = server.get_wave_data("root:w1", max_points=2, start=2)
+        self.assertEqual(p1["values"], [30.0, 40.0])
+        self.assertEqual(p1["start"], 2)
+        self.assertTrue(p1["truncated"])
+        self.assertIn("/R=[2,3]", c1.last_command)
+
+        c1_end = _PaginatedPipeClient("1d")
+        with patch.object(server, "_try_pipe_client", return_value=c1_end):
+            p2 = server.get_wave_data("root:w1", max_points=2, start=4)
+        self.assertEqual(p2["values"], [50.0])
+        self.assertEqual(p2["start"], 4)
+        self.assertFalse(p2["truncated"])
+        self.assertIn("/R=[4,4]", c1_end.last_command)
+
+        c1_past = _PaginatedPipeClient("1d")
+        with patch.object(server, "_try_pipe_client", return_value=c1_past):
+            p3 = server.get_wave_data("root:w1", max_points=2, start=5)
+        self.assertEqual(p3["values"], [])
+        self.assertEqual(p3["start"], 5)
+        self.assertFalse(p3["truncated"])
+        self.assertEqual(c1_past.last_command, "")
+
+        c2 = _PaginatedPipeClient("2d")
+        with patch.object(server, "_try_pipe_client", return_value=c2):
+            m1 = server.get_wave_data("root:mat", max_points=4, start=1)
+        self.assertEqual(m1["values"], [[3.0, 4.0], [5.0, 6.0]])
+        self.assertEqual(m1["start"], 1)
+        self.assertFalse(m1["truncated"])
+        self.assertIn("/R=[1,2]", c2.last_command)
+
+        c2_past = _PaginatedPipeClient("2d")
+        with patch.object(server, "_try_pipe_client", return_value=c2_past):
+            m2 = server.get_wave_data("root:mat", max_points=4, start=3)
+        self.assertEqual(m2["values"], [])
+        self.assertEqual(m2["start"], 3)
+        self.assertFalse(m2["truncated"])
+        self.assertEqual(c2_past.last_command, "")
+
+    def test_get_wave_data_1d_and_2d_numeric_pagination_com(self):
+        query_results_1d = iter(["1", "4", "1", "5", "1"])
+        with (
+            patch.object(server, "_try_pipe_client", return_value=None),
+            patch.object(server, "_with_igor", side_effect=lambda fn: fn(object(), 10.0)),
+            patch.object(server, "_query", side_effect=lambda *_: next(query_results_1d)),
+            patch.object(server, "_raw_execute") as execute_1d,
+            patch.object(server, "_read_tmp_file", return_value="30\r\n40\r\n"),
+        ):
+            r1 = server.get_wave_data("root:w1", max_points=2, start=2)
+        self.assertEqual(r1["values"], [30.0, 40.0])
+        self.assertEqual(r1["start"], 2)
+        self.assertTrue(r1["truncated"])
+        self.assertIn("/R=[2,3]", execute_1d.call_args.args[1])
+
+        query_results_2d = iter([
+            "1", "4", "1", "6", "2",
+            "3", "2", "0", "1", "0", "1", "s", "nm",
+        ])
+        with (
+            patch.object(server, "_try_pipe_client", return_value=None),
+            patch.object(server, "_with_igor", side_effect=lambda fn: fn(object(), 10.0)),
+            patch.object(server, "_query", side_effect=lambda *_: next(query_results_2d)),
+            patch.object(server, "_raw_execute") as execute_2d,
+            patch.object(server, "_read_tmp_file", return_value="3.0\t4.0\n"),
+        ):
+            r2 = server.get_wave_data("root:mat", max_points=2, start=1)
+        self.assertEqual(r2["values"], [[3.0, 4.0]])
+        self.assertEqual(r2["start"], 1)
+        self.assertTrue(r2["truncated"])
+        self.assertIn("/R=[1,1]", execute_2d.call_args.args[1])
+
+    def test_get_wave_data_1d_text_wave_pipe_and_com(self):
+        elements = [
+            'alpha "quoted"',
+            "line1\nline2",
+            "",
+            "tab\there",
+        ]
+
+        class _TextWavePipeClient(_FakePipeClient):
+            def __init__(self, dims: int = 1, wave_class: int = 2):
+                super().__init__()
+                self.dims = dims
+                self.wave_class = wave_class
+
+            def call_function(self, name, args=None, kwargs=None, timeout_seconds=30.0):
+                if name == "WaveExists":
+                    return {"type": "number", "value": 1}
+                if name == "WaveType":
+                    if args and len(args) > 1 and args[1] == 1:
+                        return {"type": "number", "value": self.wave_class}
+                    return {"type": "number", "value": 0}
+                if name == "numpnts":
+                    return {"type": "number", "value": len(elements)}
+                if name == "WaveDims":
+                    return {"type": "number", "value": self.dims}
+                return {"type": "number", "value": 0}
+
+            def execute_command(self, command, timeout_seconds=30.0):
+                m_sep = server.re.search(r'"%s(<<IGOR_SEP_[0-9a-f]+>>)"', command)
+                assert m_sep is not None
+                sep = m_sep.group(1)
+                m_range = server.re.search(r"/R=\[(\d+),(\d+)\]", command)
+                first_row, last_row = int(m_range.group(1)), int(m_range.group(2))
+                sliced = elements[first_row : last_row + 1]
+                payload = "".join(item.replace("\n", "\r\n") + sep for item in sliced)
+                m_out = server.re.search(r'Open \S+ as "([^"]+)"', command)
+                Path(m_out.group(1).replace("\\\\", "\\")).write_bytes(
+                    payload.encode("utf-8")
+                )
+                return {"results": "", "history": ""}
+
+        # Pipe full read
+        with patch.object(server, "_try_pipe_client", return_value=_TextWavePipeClient()):
+            full = server.get_wave_data("root:labels", max_points=10)
+        self.assertEqual(full["values"], elements)
+        self.assertEqual(full["wave_type_code"], 0)
+        self.assertFalse(full["complex"])
+        self.assertTrue(full["text"])
+        self.assertEqual(full["start"], 0)
+        self.assertFalse(full["truncated"])
+        self.assertEqual(full["npnts"], 4)
+        self.assertEqual(full["dimensions"], 1)
+
+        # Pipe paginated read
+        with patch.object(server, "_try_pipe_client", return_value=_TextWavePipeClient()):
+            paged = server.get_wave_data("root:labels", max_points=2, start=1)
+        self.assertEqual(paged["values"], ["line1\nline2", ""])
+        self.assertEqual(paged["start"], 1)
+        self.assertTrue(paged["truncated"])
+        self.assertTrue(paged["text"])
+
+        # Pipe rejects 2D text wave and wave-reference wave
+        with patch.object(server, "_try_pipe_client", return_value=_TextWavePipeClient(dims=2)):
+            with self.assertRaisesRegex(server.IgorError, "only 1D text waves"):
+                server.get_wave_data("root:text2d")
+        with patch.object(
+            server, "_try_pipe_client", return_value=_TextWavePipeClient(wave_class=4)
+        ):
+            with self.assertRaisesRegex(server.IgorError, "wave-reference"):
+                server.get_wave_data("root:wref")
+
+        # COM fallback 1D text wave (including pagination)
+        captured_cmd: list[str] = []
+
+        def _fake_raw_execute(_app, cmd):
+            captured_cmd.append(cmd)
+            m_sep = server.re.search(r'"%s(<<IGOR_SEP_[0-9a-f]+>>)"', cmd)
+            sep = m_sep.group(1)
+            m_range = server.re.search(r"/R=\[(\d+),(\d+)\]", cmd)
+            first_row, last_row = int(m_range.group(1)), int(m_range.group(2))
+            sliced = elements[first_row : last_row + 1]
+            payload = "".join(item + sep for item in sliced)
+            m_out = server.re.search(r'Open \S+ as "([^"]+)"', cmd)
+            Path(m_out.group(1).replace("\\\\", "\\")).write_text(
+                payload, encoding="utf-8"
+            )
+
+        query_results = iter(["1", "0", "2", "4", "1"])
+        with (
+            patch.object(server, "_try_pipe_client", return_value=None),
+            patch.object(server, "_with_igor", side_effect=lambda fn: fn(object(), 10.0)),
+            patch.object(server, "_query", side_effect=lambda *_: next(query_results)),
+            patch.object(server, "_raw_execute", side_effect=_fake_raw_execute),
+        ):
+            com_res = server.get_wave_data("root:labels", max_points=2, start=1)
+
+        self.assertEqual(com_res["values"], ["line1\nline2", ""])
+        self.assertTrue(com_res["text"])
+        self.assertEqual(com_res["wave_type_code"], 0)
+        self.assertFalse(com_res["complex"])
+        self.assertEqual(com_res["start"], 1)
+        self.assertTrue(com_res["truncated"])
+        self.assertIn("/R=[1,2]", captured_cmd[0])
+
+        # COM rejects DFREF wave (class 3)
+        query_dfref = iter(["1", "0", "3"])
+        with (
+            patch.object(server, "_try_pipe_client", return_value=None),
+            patch.object(server, "_with_igor", side_effect=lambda fn: fn(object(), 10.0)),
+            patch.object(server, "_query", side_effect=lambda *_: next(query_dfref)),
+        ):
+            with self.assertRaisesRegex(server.IgorError, "data-folder-reference"):
+                server.get_wave_data("root:dfref")
 
 
 if __name__ == "__main__":

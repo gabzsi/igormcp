@@ -734,6 +734,25 @@ class NamedPipeClientTests(unittest.TestCase):
                     client.get_state(timeout_seconds=2.0)
             self.assertFalse(client.is_connected)
 
+    def test_connect_populates_discovered_pid_and_clears_on_close(self) -> None:
+        def ok_handler(req: dict, _stop: threading.Event):
+            return {"ok": True}
+
+        with _MockNamedPipeServer(ok_handler) as server:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                reg = os.path.join(tmpdir, "IgorProInstances.json")
+                with open(reg, "w", encoding="utf-8") as fh:
+                    json.dump(
+                        [{"pid": os.getpid(), "pipe": server.pipe_name, "igorVersion": "10.04"}],
+                        fh,
+                    )
+                client = IgorPipeClient(instances_path=reg)
+                self.assertIsNone(client.pid)
+                client.connect(timeout_seconds=2.0)
+                self.assertEqual(client.pid, os.getpid())
+                client.close()
+                self.assertIsNone(client.pid)
+
 
 if __name__ == "__main__":
     unittest.main()

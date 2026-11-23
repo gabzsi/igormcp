@@ -6,6 +6,7 @@ Markdown knowledge is bundled; session capture is explicit and never requires Gi
 """
 
 import asyncio
+import atexit
 import base64
 import csv
 import json
@@ -25,7 +26,12 @@ from collections import deque
 from contextlib import contextmanager, suppress
 from ctypes import WINFUNCTYPE, byref, create_unicode_buffer, windll
 from ctypes import wintypes
-from typing import Annotated, Any, Iterable, Literal, TypedDict
+from typing import Annotated, Any, Iterable, Literal
+
+try:
+    from typing_extensions import TypedDict
+except ImportError:  # pragma: no cover
+    from typing import TypedDict
 
 from pydantic import Field
 from mcp.server.fastmcp import FastMCP
@@ -169,6 +175,7 @@ _SOURCE_PATH = str(Path(__file__).resolve())
 
 _lock = threading.Lock()
 _command_worker_lock = threading.Lock()
+_pipe_pool_lock = threading.Lock()
 _command_start_marker = threading.local()
 _capture_mode = "temp-file capture"
 
@@ -477,6 +484,8 @@ class WaveDataResult(TypedDict, total=False):
     dimensions: int
     wave_type_code: int
     complex: bool
+    text: bool
+    start: int
     truncated: bool
     values: list[float | str | dict[str, float | str]] | list[list[float | str]]
     # These fields apply to matrix waves.  FastMCP serializes omitted
@@ -1407,6 +1416,186 @@ def _try_pipe_client(
         return None
 
 
+_DEFAULT_TRY_PIPE_CLIENT = _try_pipe_client
+
+
+class _PipeConnectionPool:
+    """Thread-safe persistent single-slot IgorPipeClient cache.
+
+    Reuses an already-open named pipe handle across consecutive MCP tool calls
+    so calls avoid re-reading IgorProInstances.json, calling OpenProcess, and
+    re-opening the pipe handle on every request.
+
+    Safety invariants:
+    - ``_pipe_pool_lock`` is only held during checkout/checkin/reset (never
+      across blocking pipe I/O).
+    - Tests that patch ``_try_pipe_client`` bypass the cache seamlessly.
+    - Reused handles that fail pre-dispatch (``PipeNotAvailableError``) are
+      closed, discarded, and reconnected at most once.
+    - Post-dispatch errors (``PipeDispatchError`` / ``PipeTimeoutError``) or
+      disconnected handles are closed and discarded without replay.
+    - ``abort_igor`` and ``get_igor_state`` never touch this pool or its lock.
+    """
+
+    def __init__(self, lock: threading.Lock) -> None:
+        self._lock = lock
+        self._client: igor_pipe.IgorPipeClient | None = None
+        self._pipe_name: str | None = None
+        self._pid: int | None = None
+
+    def _clear_metadata_locked(self, pipe_name: str | None = None) -> None:
+        if pipe_name is None or self._pipe_name == pipe_name:
+            self._pipe_name = None
+            self._pid = None
+
+    def checkout(
+        self,
+        *,
+        timeout_seconds: float = 2.0,
+    ) -> tuple[igor_pipe.IgorPipeClient | None, bool, bool]:
+        """Return ``(client, pooled, reused)``."""
+        if _transport_mode() == "com":
+            return None, False, False
+
+        # When tests monkey-patch _try_pipe_client, bypass the cache so mock
+        # return values are always honored and never leak across tests.
+        if _try_pipe_client is not _DEFAULT_TRY_PIPE_CLIENT:
+            return (
+                _try_pipe_client(auto_start=False, timeout_seconds=timeout_seconds),
+                False,
+                False,
+            )
+
+        with self._lock:
+            cached_client = self._client
+            self._client = None
+            cached_pid = self._pid
+
+        if cached_client is not None:
+            alive = bool(getattr(cached_client, "is_connected", True))
+            if alive and cached_pid is not None:
+                alive = igor_pipe.is_pid_alive(cached_pid)
+            if alive:
+                return cached_client, True, True
+            with suppress(Exception):
+                cached_client.close()
+            with self._lock:
+                self._clear_metadata_locked(getattr(cached_client, "pipe_name", None))
+
+        fresh = _try_pipe_client(auto_start=False, timeout_seconds=timeout_seconds)
+        if fresh is None:
+            return None, False, False
+        return fresh, True, False
+
+    def checkin(self, client: igor_pipe.IgorPipeClient) -> None:
+        """Return a healthy connected client to the pool, or close if unusable."""
+        if not getattr(client, "is_connected", False):
+            self.discard(client)
+            return
+        displaced: igor_pipe.IgorPipeClient | None = None
+        with self._lock:
+            if self._client is None:
+                self._client = client
+                self._pipe_name = getattr(client, "pipe_name", None)
+                self._pid = getattr(client, "pid", None)
+            else:
+                displaced = client
+        if displaced is not None:
+            with suppress(Exception):
+                displaced.close()
+
+    def discard(self, client: igor_pipe.IgorPipeClient) -> None:
+        """Close and discard a broken or post-error client."""
+        pipe_name = getattr(client, "pipe_name", None)
+        with suppress(Exception):
+            client.close()
+        with self._lock:
+            if self._client is client:
+                self._client = None
+            self._clear_metadata_locked(pipe_name)
+
+    def reset(self) -> None:
+        """Close and clear any cached pipe connection and metadata."""
+        with self._lock:
+            client = self._client
+            self._client = None
+            self._pipe_name = None
+            self._pid = None
+        if client is not None:
+            with suppress(Exception):
+                client.close()
+
+
+_pipe_pool = _PipeConnectionPool(_pipe_pool_lock)
+
+
+def _reset_pipe_pool() -> None:
+    """Close and discard any cached persistent named-pipe client."""
+    _pipe_pool.reset()
+
+
+atexit.register(_reset_pipe_pool)
+
+
+def _run_with_pooled_pipe(
+    fn,
+    *,
+    timeout_seconds: float = 2.0,
+    can_retry=None,
+) -> tuple[bool, Any]:
+    """Run ``fn(client)`` using a pooled pipe connection.
+
+    Returns ``(True, result)`` when a pipe connection was obtained and ``fn``
+    returned, or ``(False, None)`` when no live pipe instance is available.
+    Re-raises ``PipeNotAvailableError`` after at most one fresh reconnect if a
+    cached handle went stale pre-dispatch, and discards the client on any
+    post-dispatch or transport error without replaying.
+    """
+    client, pooled, reused = _pipe_pool.checkout(timeout_seconds=timeout_seconds)
+    if client is None:
+        return False, None
+
+    while True:
+        try:
+            result = fn(client)
+        except igor_pipe.PipeNotAvailableError:
+            if pooled:
+                _pipe_pool.discard(client)
+            else:
+                with suppress(Exception):
+                    client.close()
+            if pooled and reused and (can_retry is None or can_retry()):
+                reused = False
+                client = _try_pipe_client(
+                    auto_start=False, timeout_seconds=timeout_seconds
+                )
+                if client is None:
+                    raise
+                continue
+            raise
+        except (igor_pipe.PipeRPCError, IgorError):
+            if pooled:
+                _pipe_pool.checkin(client)
+            else:
+                with suppress(Exception):
+                    client.close()
+            raise
+        except BaseException:
+            if pooled:
+                _pipe_pool.discard(client)
+            else:
+                with suppress(Exception):
+                    client.close()
+            raise
+        else:
+            if pooled:
+                _pipe_pool.checkin(client)
+            else:
+                with suppress(Exception):
+                    client.close()
+            return True, result
+
+
 def _is_igor_main_window_candidate(class_name: str, title: str) -> bool:
     """Return True only for Igor Pro's actual top-level main application window."""
     if not title or not title.strip():
@@ -1880,6 +2069,8 @@ def _execute_igor_via_pipe(
     except igor_pipe.PipeDispatchError as exc:
         # Covers PipeTimeoutError (subclass of PipeDispatchError) and broken pipe
         # post-dispatch: NEVER fall back or replay over COM.
+        with suppress(Exception):
+            client.close()
         dispatch_error = exc
     finally:
         stop_event.set()
@@ -2013,34 +2204,37 @@ def _execute_igor_direct(
 
     mode = _transport_mode()
     if mode != "com":
-        client = _try_pipe_client(auto_start=False, timeout_seconds=2.0)
-        if client is not None:
-            try:
-                return _execute_igor_via_pipe(
+        try:
+            used_pipe, pipe_result = _run_with_pooled_pipe(
+                lambda client: _execute_igor_via_pipe(
                     client,
                     command,
                     timeout_seconds=effective_timeout,
-                    started_callback=_fire_started_once if started_callback is not None else None,
-                )
-            except igor_pipe.PipeNotAvailableError as exc:
-                if mode == "pipe":
-                    return _failed_execute_result(
-                        str(exc),
-                        command_started=False,
-                        outcome_known=True,
-                        transport="pipe",
-                    )
-                # Pre-dispatch failure in 'auto' mode: safe to fall back to COM.
-                callback_fired = False
-            finally:
-                client.close()
-        elif mode == "pipe":
-            return _failed_execute_result(
-                "No active Igor Pro named-pipe instance found (IGOR_TRANSPORT=pipe).",
-                command_started=False,
-                outcome_known=True,
-                transport="pipe",
+                    started_callback=(
+                        _fire_started_once if started_callback is not None else None
+                    ),
+                ),
+                timeout_seconds=2.0,
             )
+            if used_pipe:
+                return pipe_result
+            if mode == "pipe":
+                return _failed_execute_result(
+                    "No active Igor Pro named-pipe instance found (IGOR_TRANSPORT=pipe).",
+                    command_started=False,
+                    outcome_known=True,
+                    transport="pipe",
+                )
+        except igor_pipe.PipeNotAvailableError as exc:
+            if mode == "pipe":
+                return _failed_execute_result(
+                    str(exc),
+                    command_started=False,
+                    outcome_known=True,
+                    transport="pipe",
+                )
+            # Pre-dispatch failure in 'auto' mode: safe to fall back to COM.
+            callback_fired = False
 
     compilation_errors: dict[int, dict[str, object]] = {}
 
@@ -2417,144 +2611,148 @@ def _open_igor_experiment_direct(
 
     mode = _transport_mode()
     if mode != "com":
-        client = _try_pipe_client(auto_start=False, timeout_seconds=2.0)
-        if client is not None:
-            pipe_unavailable = False
+        def _open_via_pipe(client: igor_pipe.IgorPipeClient) -> OpenIgorExperimentResult:
+            before = _igor_dialogs()
+            if before:
+                compilation_errors = _capture_compilation_errors(
+                    before, phase="before_experiment_open"
+                )
+                return _failed_open_igor_experiment_result(
+                    file_path,
+                    _dialog_blocking_message(before, "before experiment open"),
+                    command_started=False,
+                    outcome_known=True,
+                    dialog_details=before,
+                    compilation_errors=compilation_errors,
+                )
+
+            if started_callback is not None:
+                started_callback()
+            marker = getattr(_command_start_marker, "event", None)
+            if marker is not None:
+                marker.set()
+
+            cmd = f'Execute/P/Q "LOADFILE {_igor_escape(file_path)}"'
             try:
-                before = _igor_dialogs()
-                if before:
-                    compilation_errors = _capture_compilation_errors(
-                        before, phase="before_experiment_open"
-                    )
-                    return _failed_open_igor_experiment_result(
-                        file_path,
-                        _dialog_blocking_message(before, "before experiment open"),
-                        command_started=False,
-                        outcome_known=True,
-                        dialog_details=before,
-                        compilation_errors=compilation_errors,
-                    )
-
-                if started_callback is not None:
-                    started_callback()
-                marker = getattr(_command_start_marker, "event", None)
+                resp = client.execute_command(
+                    cmd, timeout_seconds=_IGOR_COMMAND_TIMEOUT_SECONDS
+                )
+            except igor_pipe.PipeNotAvailableError:
                 if marker is not None:
-                    marker.set()
+                    marker.clear()
+                raise
+            except igor_pipe.PipeDispatchError as exc:
+                # Post-dispatch failure: never replay over COM.
+                with suppress(Exception):
+                    client.close()
+                after = _igor_dialogs()
+                compilation_errors = _capture_compilation_errors(
+                    after, phase="after_experiment_open"
+                )
+                return _failed_open_igor_experiment_result(
+                    file_path,
+                    str(exc),
+                    command_started=True,
+                    outcome_known=False,
+                    dialog_details=after,
+                    compilation_errors=compilation_errors,
+                )
+            except igor_pipe.PipeRPCError as exc:
+                after = _igor_dialogs()
+                compilation_errors = _capture_compilation_errors(
+                    after, phase="after_experiment_open"
+                )
+                return _failed_open_igor_experiment_result(
+                    file_path,
+                    str(exc),
+                    command_started=True,
+                    outcome_known=True,
+                    dialog_details=after,
+                    compilation_errors=compilation_errors,
+                )
 
-                cmd = f'Execute/P/Q "LOADFILE {_igor_escape(file_path)}"'
-                try:
-                    resp = client.execute_command(
-                        cmd, timeout_seconds=_IGOR_COMMAND_TIMEOUT_SECONDS
-                    )
-                except igor_pipe.PipeNotAvailableError as exc:
-                    if marker is not None:
-                        marker.clear()
-                    if mode == "pipe":
-                        return _failed_open_igor_experiment_result(
-                            file_path,
-                            str(exc),
-                            command_started=False,
-                            outcome_known=True,
-                        )
-                    pipe_unavailable = True
-                except igor_pipe.PipeDispatchError as exc:
-                    # Post-dispatch failure: never replay over COM.
-                    after = _igor_dialogs()
-                    compilation_errors = _capture_compilation_errors(
-                        after, phase="after_experiment_open"
-                    )
-                    return _failed_open_igor_experiment_result(
-                        file_path,
-                        str(exc),
-                        command_started=True,
-                        outcome_known=False,
-                        dialog_details=after,
-                        compilation_errors=compilation_errors,
-                    )
-                except igor_pipe.PipeRPCError as exc:
-                    after = _igor_dialogs()
-                    compilation_errors = _capture_compilation_errors(
-                        after, phase="after_experiment_open"
-                    )
-                    return _failed_open_igor_experiment_result(
-                        file_path,
-                        str(exc),
-                        command_started=True,
-                        outcome_known=True,
-                        dialog_details=after,
-                        compilation_errors=compilation_errors,
-                    )
+            error_code = resp.get("errorCode", 0)
+            raw_error = resp.get("errorMessage") or resp.get("error")
+            if error_code or resp.get("ok") is False:
+                err_msg = (
+                    f"IGOR ERROR {error_code}: {raw_error}"
+                    if error_code
+                    else str(raw_error or "Igor failed to open experiment")
+                )
+                after = _igor_dialogs()
+                compilation_errors = _capture_compilation_errors(
+                    after, phase="after_experiment_open"
+                )
+                return _failed_open_igor_experiment_result(
+                    file_path,
+                    err_msg,
+                    command_started=True,
+                    outcome_known=True,
+                    dialog_details=after,
+                    compilation_errors=compilation_errors,
+                )
 
-                if not pipe_unavailable:
-                    error_code = resp.get("errorCode", 0)
-                    raw_error = resp.get("errorMessage") or resp.get("error")
-                    if error_code or resp.get("ok") is False:
-                        err_msg = (
-                            f"IGOR ERROR {error_code}: {raw_error}"
-                            if error_code
-                            else str(raw_error or "Igor failed to open experiment")
-                        )
-                        after = _igor_dialogs()
-                        compilation_errors = _capture_compilation_errors(
-                            after, phase="after_experiment_open"
-                        )
-                        return _failed_open_igor_experiment_result(
-                            file_path,
-                            err_msg,
-                            command_started=True,
-                            outcome_known=True,
-                            dialog_details=after,
-                            compilation_errors=compilation_errors,
-                        )
+            after = _igor_dialogs()
+            if after:
+                compilation_errors = _capture_compilation_errors(
+                    after, phase="after_experiment_open"
+                )
+                return _failed_open_igor_experiment_result(
+                    file_path,
+                    _dialog_blocking_message(
+                        after, "during or after experiment open"
+                    ),
+                    command_started=True,
+                    outcome_known=False,
+                    dialog_details=after,
+                    compilation_errors=compilation_errors,
+                )
 
-                    after = _igor_dialogs()
-                    if after:
-                        compilation_errors = _capture_compilation_errors(
-                            after, phase="after_experiment_open"
-                        )
-                        return _failed_open_igor_experiment_result(
-                            file_path,
-                            _dialog_blocking_message(
-                                after, "during or after experiment open"
-                            ),
-                            command_started=True,
-                            outcome_known=False,
-                            dialog_details=after,
-                            compilation_errors=compilation_errors,
-                        )
+            experiment_name: str | None = None
+            try:
+                info_resp = client.call_function(
+                    "IgorInfo", [1], timeout_seconds=10.0
+                )
+                raw_exp = str(info_resp.get("value", "") or "").strip()
+                experiment_name = raw_exp or None
+            except igor_pipe.IgorPipeError:
+                experiment_name = None
 
-                    experiment_name: str | None = None
-                    try:
-                        info_resp = client.call_function(
-                            "IgorInfo", [1], timeout_seconds=10.0
-                        )
-                        raw_exp = str(info_resp.get("value", "") or "").strip()
-                        experiment_name = raw_exp or None
-                    except igor_pipe.IgorPipeError:
-                        experiment_name = None
+            return {
+                "ok": True,
+                "file_path": file_path,
+                "current_experiment": experiment_name,
+                "error": None,
+                "load_started": True,
+                "load_completed": True,
+                "outcome_known": True,
+                "dialogs_open": 0,
+                "dialog_titles": [],
+                "dialog_details": [],
+                "compilation_errors": [],
+            }
 
-                    return {
-                        "ok": True,
-                        "file_path": file_path,
-                        "current_experiment": experiment_name,
-                        "error": None,
-                        "load_started": True,
-                        "load_completed": True,
-                        "outcome_known": True,
-                        "dialogs_open": 0,
-                        "dialog_titles": [],
-                        "dialog_details": [],
-                        "compilation_errors": [],
-                    }
-            finally:
-                client.close()
-        elif mode == "pipe":
-            return _failed_open_igor_experiment_result(
-                file_path,
-                "No active Igor Pro named-pipe instance found (IGOR_TRANSPORT=pipe).",
-                command_started=False,
-                outcome_known=True,
+        try:
+            used_pipe, pipe_result = _run_with_pooled_pipe(
+                _open_via_pipe, timeout_seconds=2.0
             )
+            if used_pipe:
+                return pipe_result
+            if mode == "pipe":
+                return _failed_open_igor_experiment_result(
+                    file_path,
+                    "No active Igor Pro named-pipe instance found (IGOR_TRANSPORT=pipe).",
+                    command_started=False,
+                    outcome_known=True,
+                )
+        except igor_pipe.PipeNotAvailableError as exc:
+            if mode == "pipe":
+                return _failed_open_igor_experiment_result(
+                    file_path,
+                    str(exc),
+                    command_started=False,
+                    outcome_known=True,
+                )
 
     def operation(app, _version):
         before = _igor_dialogs()
@@ -2821,143 +3019,150 @@ def import_delimited_text(
 
     mode = _transport_mode()
     if mode != "com":
-        client = _try_pipe_client(auto_start=False, timeout_seconds=2.0)
-        if client is not None:
-            mutating_started = False
-            try:
-                exists_resp = client.call_function(
-                    "DataFolderExists", [folder], timeout_seconds=10.0
-                )
-                try:
-                    folder_exists = int(exists_resp.get("value")) == 1
-                except (TypeError, ValueError):
-                    folder_exists = False
-                if not folder_exists:
-                    raise IgorError(f"Data folder '{folder}' does not exist")
+        mutating_started = False
 
-                target_paths = [f"{folder}{name}" for name in wave_names]
-                escaped_folder = _igor_escape(folder)
-                list_resp = client.execute_command(
-                    f'fprintf 0, "%s", WaveList("*", ";", "", $"{escaped_folder}")',
+        def _import_via_pipe(client: igor_pipe.IgorPipeClient) -> DelimitedImportResult:
+            nonlocal mutating_started
+            exists_resp = client.call_function(
+                "DataFolderExists", [folder], timeout_seconds=10.0
+            )
+            try:
+                folder_exists = int(exists_resp.get("value")) == 1
+            except (TypeError, ValueError):
+                folder_exists = False
+            if not folder_exists:
+                raise IgorError(f"Data folder '{folder}' does not exist")
+
+            target_paths = [f"{folder}{name}" for name in wave_names]
+            escaped_folder = _igor_escape(folder)
+            list_resp = client.execute_command(
+                f'fprintf 0, "%s", WaveList("*", ";", "", $"{escaped_folder}")',
+                timeout_seconds=10.0,
+            )
+            if list_resp.get("errorCode"):
+                raise IgorError(
+                    f"Failed to list waves in '{folder}': "
+                    f"{list_resp.get('errorMessage') or list_resp.get('errorCode')}"
+                )
+            existing_names = {
+                name
+                for name in str(list_resp.get("results", "") or "").split(";")
+                if name.strip()
+            }
+            collisions = [
+                target
+                for name, target in zip(wave_names, target_paths)
+                if name in existing_names
+            ]
+            if collisions and not overwrite:
+                joined = ", ".join(collisions[:5])
+                extra = (
+                    ""
+                    if len(collisions) <= 5
+                    else f" and {len(collisions) - 5} more"
+                )
+                raise IgorError(
+                    f"Destination wave already exists: {joined}{extra}. "
+                    "Choose another prefix or set overwrite=true."
+                )
+
+            temporary_prefix, temporary_names = _reserve_import_wave_names_pipe(
+                client, len(headers)
+            )
+            moved_targets: list[str] = []
+            mutating_started = True
+            try:
+                with _normalized_import_file(
+                    rows, delimiter_character
+                ) as normalized_path:
+                    command = (
+                        f'LoadWave/J/D/A={temporary_prefix}/O/K=0 '
+                        f'"{normalized_path}"'
+                    )
+                    load_resp = client.execute_command(
+                        command, timeout_seconds=25.0
+                    )
+                    if load_resp.get("errorCode"):
+                        raise IgorError(
+                            f"LoadWave failed: "
+                            f"{load_resp.get('errorMessage') or load_resp.get('errorCode')}"
+                        )
+
+                imported_resp = client.call_function(
+                    "WaveList",
+                    [f"{temporary_prefix}*", ";", ""],
                     timeout_seconds=10.0,
                 )
-                if list_resp.get("errorCode"):
-                    raise IgorError(
-                        f"Failed to list waves in '{folder}': "
-                        f"{list_resp.get('errorMessage') or list_resp.get('errorCode')}"
-                    )
-                existing_names = {
+                imported_matches = {
                     name
-                    for name in str(list_resp.get("results", "") or "").split(";")
-                    if name.strip()
+                    for name in str(imported_resp.get("value", "") or "").split(";")
+                    if name
                 }
-                collisions = [
-                    target
-                    for name, target in zip(wave_names, target_paths)
-                    if name in existing_names
+                missing = [
+                    name
+                    for name in temporary_names
+                    if name not in imported_matches
                 ]
-                if collisions and not overwrite:
-                    joined = ", ".join(collisions[:5])
-                    extra = (
-                        ""
-                        if len(collisions) <= 5
-                        else f" and {len(collisions) - 5} more"
-                    )
+                if missing:
                     raise IgorError(
-                        f"Destination wave already exists: {joined}{extra}. "
-                        "Choose another prefix or set overwrite=true."
+                        "Igor did not create the expected temporary import waves: "
+                        + ", ".join(missing)
                     )
 
-                temporary_prefix, temporary_names = _reserve_import_wave_names_pipe(
-                    client, len(headers)
-                )
-                moved_targets: list[str] = []
-                mutating_started = True
-                try:
-                    with _normalized_import_file(
-                        rows, delimiter_character
-                    ) as normalized_path:
-                        command = (
-                            f'LoadWave/J/D/A={temporary_prefix}/O/K=0 '
-                            f'"{normalized_path}"'
+                if overwrite:
+                    for target in collisions:
+                        kill_resp = client.execute_command(
+                            f"KillWaves/Z {target}", timeout_seconds=10.0
                         )
-                        load_resp = client.execute_command(
-                            command, timeout_seconds=25.0
-                        )
-                        if load_resp.get("errorCode"):
+                        if kill_resp.get("errorCode"):
                             raise IgorError(
-                                f"LoadWave failed: "
-                                f"{load_resp.get('errorMessage') or load_resp.get('errorCode')}"
+                                f"KillWaves failed for {target}: "
+                                f"{kill_resp.get('errorMessage') or kill_resp.get('errorCode')}"
                             )
-
-                    imported_resp = client.call_function(
-                        "WaveList",
-                        [f"{temporary_prefix}*", ";", ""],
+                for temporary_name, target in zip(temporary_names, target_paths):
+                    move_resp = client.execute_command(
+                        f"MoveWave {temporary_name}, {target}",
                         timeout_seconds=10.0,
                     )
-                    imported_matches = {
-                        name
-                        for name in str(imported_resp.get("value", "") or "").split(";")
-                        if name
-                    }
-                    missing = [
-                        name
-                        for name in temporary_names
-                        if name not in imported_matches
-                    ]
-                    if missing:
+                    if move_resp.get("errorCode"):
                         raise IgorError(
-                            "Igor did not create the expected temporary import waves: "
-                            + ", ".join(missing)
+                            f"MoveWave failed for {target}: "
+                            f"{move_resp.get('errorMessage') or move_resp.get('errorCode')}"
                         )
+                    moved_targets.append(target)
+            except Exception:
+                _kill_waves_quietly_pipe(client, temporary_names)
+                _kill_waves_quietly_pipe(client, moved_targets)
+                raise
 
-                    if overwrite:
-                        for target in collisions:
-                            kill_resp = client.execute_command(
-                                f"KillWaves/Z {target}", timeout_seconds=10.0
-                            )
-                            if kill_resp.get("errorCode"):
-                                raise IgorError(
-                                    f"KillWaves failed for {target}: "
-                                    f"{kill_resp.get('errorMessage') or kill_resp.get('errorCode')}"
-                                )
-                    for temporary_name, target in zip(temporary_names, target_paths):
-                        move_resp = client.execute_command(
-                            f"MoveWave {temporary_name}, {target}",
-                            timeout_seconds=10.0,
-                        )
-                        if move_resp.get("errorCode"):
-                            raise IgorError(
-                                f"MoveWave failed for {target}: "
-                                f"{move_resp.get('errorMessage') or move_resp.get('errorCode')}"
-                            )
-                        moved_targets.append(target)
-                except Exception:
-                    _kill_waves_quietly_pipe(client, temporary_names)
-                    _kill_waves_quietly_pipe(client, moved_targets)
-                    raise
+            return {
+                "source_path": str(resolved_path),
+                "folder": folder,
+                "prefix": prefix,
+                "rows": len(rows),
+                "columns": len(headers),
+                "waves": wave_names,
+                "headers": headers,
+                "portable_object_name_limit": _MAX_IGOR_OBJECT_NAME_LENGTH,
+            }
 
-                return {
-                    "source_path": str(resolved_path),
-                    "folder": folder,
-                    "prefix": prefix,
-                    "rows": len(rows),
-                    "columns": len(headers),
-                    "waves": wave_names,
-                    "headers": headers,
-                    "portable_object_name_limit": _MAX_IGOR_OBJECT_NAME_LENGTH,
-                }
-            except igor_pipe.PipeNotAvailableError as exc:
-                if mode == "pipe" or mutating_started:
-                    raise IgorError(str(exc)) from exc
-            except igor_pipe.IgorPipeError as exc:
-                raise IgorError(str(exc)) from exc
-            finally:
-                client.close()
-        elif mode == "pipe":
-            raise IgorError(
-                "No active Igor Pro named-pipe instance found (IGOR_TRANSPORT=pipe)."
+        try:
+            used_pipe, pipe_result = _run_with_pooled_pipe(
+                _import_via_pipe,
+                timeout_seconds=2.0,
+                can_retry=lambda: not mutating_started,
             )
+            if used_pipe:
+                return pipe_result
+            if mode == "pipe":
+                raise IgorError(
+                    "No active Igor Pro named-pipe instance found (IGOR_TRANSPORT=pipe)."
+                )
+        except igor_pipe.PipeNotAvailableError as exc:
+            if mode == "pipe" or mutating_started:
+                raise IgorError(str(exc)) from exc
+        except igor_pipe.IgorPipeError as exc:
+            raise IgorError(str(exc)) from exc
 
     def operation(app, version):
         escaped_folder = _igor_escape(folder)
@@ -3043,54 +3248,57 @@ def read_variable(
 
     mode = _transport_mode()
     if mode != "com":
-        client = _try_pipe_client(auto_start=False, timeout_seconds=2.0)
-        if client is not None:
+        def _read_var_via_pipe(client: igor_pipe.IgorPipeClient) -> VariableResult:
+            exists_resp = client.call_function("exists", [name], timeout_seconds=10.0)
+            raw_exists = exists_resp.get("value")
             try:
-                exists_resp = client.call_function("exists", [name], timeout_seconds=10.0)
-                raw_exists = exists_resp.get("value")
-                try:
-                    exists_code = int(raw_exists)
-                except (TypeError, ValueError):
-                    exists_code = -1
-                if exists_code != 2:
-                    raise IgorError(
-                        f"'{name}' is not a global variable "
-                        f"(Igor exists() code {raw_exists})"
-                    )
-                not_a_string = f"IGOR_MCP_{uuid.uuid4().hex}"
-                str_resp = client.call_function(
-                    "StrVarOrDefault", [name, not_a_string], timeout_seconds=10.0
+                exists_code = int(raw_exists)
+            except (TypeError, ValueError):
+                exists_code = -1
+            if exists_code != 2:
+                raise IgorError(
+                    f"'{name}' is not a global variable "
+                    f"(Igor exists() code {raw_exists})"
                 )
-                str_val = str_resp.get("value")
-                if isinstance(str_val, str) and str_val != not_a_string:
-                    return {"name": name, "type": "string", "value": str_val}
-                num_resp = client.call_function(
-                    "NumVarOrDefault", [name, 0.0], timeout_seconds=10.0
-                )
-                num_val = num_resp.get("value")
-                if isinstance(num_val, (int, float)) and not isinstance(num_val, bool):
-                    if math.isfinite(num_val):
-                        value: float | str = float(num_val)
-                    elif math.isnan(num_val):
-                        value = "NaN"
-                    else:
-                        value = "Inf" if num_val > 0 else "-Inf"
-                elif num_val is None:
+            not_a_string = f"IGOR_MCP_{uuid.uuid4().hex}"
+            str_resp = client.call_function(
+                "StrVarOrDefault", [name, not_a_string], timeout_seconds=10.0
+            )
+            str_val = str_resp.get("value")
+            if isinstance(str_val, str) and str_val != not_a_string:
+                return {"name": name, "type": "string", "value": str_val}
+            num_resp = client.call_function(
+                "NumVarOrDefault", [name, 0.0], timeout_seconds=10.0
+            )
+            num_val = num_resp.get("value")
+            if isinstance(num_val, (int, float)) and not isinstance(num_val, bool):
+                if math.isfinite(num_val):
+                    value: float | str = float(num_val)
+                elif math.isnan(num_val):
                     value = "NaN"
                 else:
-                    value = _json_numeric_value(str(num_val))
-                return {"name": name, "type": "numeric", "value": value}
-            except igor_pipe.PipeNotAvailableError as exc:
-                if mode == "pipe":
-                    raise IgorError(str(exc)) from exc
-            except igor_pipe.IgorPipeError as exc:
-                raise IgorError(str(exc)) from exc
-            finally:
-                client.close()
-        elif mode == "pipe":
-            raise IgorError(
-                "No active Igor Pro named-pipe instance found (IGOR_TRANSPORT=pipe)."
+                    value = "Inf" if num_val > 0 else "-Inf"
+            elif num_val is None:
+                value = "NaN"
+            else:
+                value = _json_numeric_value(str(num_val))
+            return {"name": name, "type": "numeric", "value": value}
+
+        try:
+            used_pipe, pipe_result = _run_with_pooled_pipe(
+                _read_var_via_pipe, timeout_seconds=2.0
             )
+            if used_pipe:
+                return pipe_result
+            if mode == "pipe":
+                raise IgorError(
+                    "No active Igor Pro named-pipe instance found (IGOR_TRANSPORT=pipe)."
+                )
+        except igor_pipe.PipeNotAvailableError as exc:
+            if mode == "pipe":
+                raise IgorError(str(exc)) from exc
+        except igor_pipe.IgorPipeError as exc:
+            raise IgorError(str(exc)) from exc
 
     def operation(app, _version):
         escaped_name = _igor_escape(name)
@@ -3118,11 +3326,20 @@ def read_variable(
     return _with_igor(operation)
 
 
+def _validate_start_index(start: int) -> int:
+    if isinstance(start, bool) or not isinstance(start, int):
+        raise IgorError("start must be a non-negative integer")
+    if start < 0:
+        raise IgorError("start must be a non-negative integer")
+    return start
+
+
 def _export_wave_slice(
     app,
     escaped_name: str,
     format_string: str,
     last_row: int,
+    first_row: int = 0,
 ) -> list[str]:
     """Export a wave slice to a temporary file via wfprintf and return non-empty lines."""
     file_ref = _helper_name("igorMcpFile")
@@ -3131,12 +3348,52 @@ def _export_wave_slice(
             f"Variable {file_ref}; "
             f'Open {file_ref} as "{_igor_escape(path)}"; '
             f'wfprintf {file_ref}, "{format_string}" '
-            f'/R=[0,{last_row}] $"{escaped_name}"; '
+            f'/R=[{first_row},{last_row}] $"{escaped_name}"; '
             f"Close {file_ref}; KillVariables/Z {file_ref}"
         )
         _raw_execute(app, line)
         text = _normalize_newlines(_read_tmp_file(path))
     return [l for l in text.splitlines() if l.strip()]
+
+
+def _parse_delimited_text_wave_payload(
+    raw_text: str, delimiter: str, expected_count: int
+) -> list[str]:
+    """Split a wfprintf-exported 1D text wave payload using its unique record marker."""
+    normalized = _normalize_newlines(raw_text)
+    if not normalized.endswith(delimiter):
+        raise IgorError(
+            f"Igor returned malformed text-wave data (expected {expected_count} elements)"
+        )
+    parts = normalized.split(delimiter)[:-1]
+    if len(parts) != expected_count:
+        raise IgorError(
+            f"Igor returned {len(parts)} text-wave elements; expected {expected_count}"
+        )
+    return parts
+
+
+def _export_text_wave_slice(
+    app,
+    escaped_name: str,
+    first_row: int,
+    last_row: int,
+) -> list[str]:
+    """Export a 1D text wave slice via wfprintf using a unique record delimiter."""
+    file_ref = _helper_name("igorMcpFile")
+    delimiter = f"<<IGOR_SEP_{uuid.uuid4().hex[:16]}>>"
+    expected_count = last_row - first_row + 1
+    with _temporary_output_file() as path:
+        line = (
+            f"Variable {file_ref}; "
+            f'Open {file_ref} as "{_igor_escape(path)}"; '
+            f'wfprintf {file_ref}, "%s{delimiter}" '
+            f'/R=[{first_row},{last_row}] $"{escaped_name}"; '
+            f"Close {file_ref}; KillVariables/Z {file_ref}"
+        )
+        _raw_execute(app, line)
+        raw_text = _read_tmp_file(path)
+    return _parse_delimited_text_wave_payload(raw_text, delimiter, expected_count)
 
 
 def _validate_numeric_wave(
@@ -3182,6 +3439,54 @@ def _validate_numeric_wave(
     return wave_type, point_count, dimensions
 
 
+def _validate_readable_wave(
+    app, version: float, wave_name: str, escaped_name: str
+) -> tuple[int, int, int, bool]:
+    """Verify that a wave exists and is a 1D/2D numeric wave or 1D text wave.
+
+    Returns ``(wave_type, point_count, dimensions, is_text)``.
+    """
+    if _query(app, "%d", f'WaveExists($"{escaped_name}")').strip() != "1":
+        raise IgorError(f"Wave '{wave_name}' not found")
+    wave_type = int(_query(app, "%d", f'WaveType($"{escaped_name}")').strip())
+    is_text = False
+    if version >= _WAVE_TYPE_SELECTOR_VERSION:
+        wave_class = int(
+            _query(app, "%d", f'WaveType($"{escaped_name}", 1)').strip()
+        )
+        class_names = {
+            0: "invalid",
+            2: "text",
+            3: "data-folder-reference",
+            4: "wave-reference",
+        }
+        if wave_class == 2:
+            is_text = True
+        elif wave_class != 1:
+            class_name = class_names.get(wave_class, f"unknown class {wave_class}")
+            raise IgorError(
+                f"Wave '{wave_name}' is a {class_name} wave; "
+                "only numeric and 1D text waves are supported"
+            )
+    elif wave_type == 0:
+        # In Igor 6.0, plain WaveType returns zero for a text wave or a
+        # missing wave. WaveExists above has already excluded the latter.
+        is_text = True
+
+    point_count = int(_query(app, "%d", f'numpnts($"{escaped_name}")').strip())
+    dimensions = int(_query(app, "%d", f'WaveDims($"{escaped_name}")').strip())
+    if is_text:
+        if dimensions > 1 or (dimensions == 0 and point_count > 0):
+            raise IgorError(
+                f"Wave '{wave_name}' is a {dimensions}D text wave; only 1D text waves are supported"
+            )
+    elif dimensions > 2 or (dimensions == 0 and point_count > 0):
+        raise IgorError(
+            f"Wave '{wave_name}' has {dimensions} dimensions; only 1D and 2D waves are supported"
+        )
+    return wave_type, point_count, dimensions, is_text
+
+
 def _get_2d_wave_data(
     app,
     wave_name: str,
@@ -3190,6 +3495,7 @@ def _get_2d_wave_data(
     point_count: int,
     is_complex: bool,
     max_points: int,
+    start: int = 0,
 ) -> WaveDataResult:
     """Read metadata and matrix values from a 2D numeric wave."""
     num_rows = int(_query(app, "%d", f'DimSize($"{escaped_name}", 0)').strip())
@@ -3201,13 +3507,22 @@ def _get_2d_wave_data(
     x_units = _query(app, "%s", f'WaveUnits($"{escaped_name}", 0)').strip()
     y_units = _query(app, "%s", f'WaveUnits($"{escaped_name}", 1)').strip()
 
-    max_rows = max(1, max_points // max(1, num_cols)) if num_cols > 0 else 0
-    rows_to_read = min(num_rows, max_rows)
+    if start >= num_rows or num_cols <= 0 or max_points == 0:
+        rows_to_read = 0
+    else:
+        max_rows = max(1, max_points // max(1, num_cols))
+        rows_to_read = min(num_rows - start, max_rows)
     matrix_values: list[list[float | str]] = []
 
     if rows_to_read > 0 and num_cols > 0:
         format_string = "\\t".join(["%.17g"] * num_cols) + "\\n"
-        lines = _export_wave_slice(app, escaped_name, format_string, rows_to_read - 1)
+        lines = _export_wave_slice(
+            app,
+            escaped_name,
+            format_string,
+            start + rows_to_read - 1,
+            first_row=start,
+        )
         for line_str in lines:
             tokens = [t.strip() for t in line_str.split("\t") if t.strip()]
             matrix_values.append([_json_numeric_value(t) for t in tokens])
@@ -3226,7 +3541,8 @@ def _get_2d_wave_data(
         "y_units": y_units,
         "wave_type_code": wave_type,
         "complex": is_complex,
-        "truncated": rows_to_read < num_rows,
+        "start": start,
+        "truncated": (start + rows_to_read) < num_rows,
         "values": matrix_values,
     }
 
@@ -3240,13 +3556,20 @@ def _get_1d_wave_data(
     dimensions: int,
     is_complex: bool,
     max_points: int,
+    start: int = 0,
 ) -> WaveDataResult:
     """Read metadata and values from a 1D (or empty 0D) numeric wave."""
-    count = min(point_count, max_points)
+    count = 0 if start >= point_count else min(point_count - start, max_points)
     values: list[float | str | dict[str, float | str]] = []
     if count:
         format_string = "%.17g,%.17g\\n" if is_complex else "%.17g\\n"
-        rows = _export_wave_slice(app, escaped_name, format_string, count - 1)
+        rows = _export_wave_slice(
+            app,
+            escaped_name,
+            format_string,
+            start + count - 1,
+            first_row=start,
+        )
         if len(rows) != count:
             raise IgorError(
                 f"Igor returned {len(rows)} wave rows; expected {count}"
@@ -3271,7 +3594,37 @@ def _get_1d_wave_data(
         "dimensions": dimensions,
         "wave_type_code": wave_type,
         "complex": is_complex,
-        "truncated": count < point_count,
+        "start": start,
+        "truncated": (start + count) < point_count,
+        "values": values,
+    }
+
+
+def _get_1d_text_wave_data(
+    app,
+    wave_name: str,
+    escaped_name: str,
+    point_count: int,
+    dimensions: int,
+    max_points: int,
+    start: int = 0,
+) -> WaveDataResult:
+    """Read metadata and string values from a 1D (or empty) text wave over COM."""
+    count = 0 if start >= point_count else min(point_count - start, max_points)
+    values: list[str] = []
+    if count:
+        values = _export_text_wave_slice(
+            app, escaped_name, start, start + count - 1
+        )
+    return {
+        "name": wave_name,
+        "npnts": point_count,
+        "dimensions": dimensions,
+        "wave_type_code": 0,
+        "complex": False,
+        "text": True,
+        "start": start,
+        "truncated": (start + count) < point_count,
         "values": values,
     }
 
@@ -3315,6 +3668,7 @@ def _export_wave_slice_pipe(
     escaped_name: str,
     format_string: str,
     last_row: int,
+    first_row: int = 0,
 ) -> list[str]:
     """Export a wave slice over the native pipe to a temporary file via wfprintf."""
     file_ref = _helper_name("igorMcpFile")
@@ -3323,7 +3677,7 @@ def _export_wave_slice_pipe(
             f"Variable {file_ref}; "
             f'Open {file_ref} as "{_igor_escape(path)}"; '
             f'wfprintf {file_ref}, "{format_string}" '
-            f'/R=[0,{last_row}] $"{escaped_name}"; '
+            f'/R=[{first_row},{last_row}] $"{escaped_name}"; '
             f"Close {file_ref}; KillVariables/Z {file_ref}"
         )
         resp = client.execute_command(cmd, timeout_seconds=25.0)
@@ -3336,12 +3690,41 @@ def _export_wave_slice_pipe(
     return [line for line in text.splitlines() if line.strip()]
 
 
+def _export_text_wave_slice_pipe(
+    client: igor_pipe.IgorPipeClient,
+    escaped_name: str,
+    first_row: int,
+    last_row: int,
+) -> list[str]:
+    """Export a 1D text wave slice over the native pipe via wfprintf."""
+    file_ref = _helper_name("igorMcpFile")
+    delimiter = f"<<IGOR_SEP_{uuid.uuid4().hex[:16]}>>"
+    expected_count = last_row - first_row + 1
+    with _temporary_output_file() as path:
+        cmd = (
+            f"Variable {file_ref}; "
+            f'Open {file_ref} as "{_igor_escape(path)}"; '
+            f'wfprintf {file_ref}, "%s{delimiter}" '
+            f'/R=[{first_row},{last_row}] $"{escaped_name}"; '
+            f"Close {file_ref}; KillVariables/Z {file_ref}"
+        )
+        resp = client.execute_command(cmd, timeout_seconds=25.0)
+        if resp.get("errorCode"):
+            raise IgorError(
+                f"Failed to export text wave slice: "
+                f"{resp.get('errorMessage') or resp.get('errorCode')}"
+            )
+        raw_text = _read_tmp_file(path)
+    return _parse_delimited_text_wave_payload(raw_text, delimiter, expected_count)
+
+
 def _get_wave_data_via_pipe(
     client: igor_pipe.IgorPipeClient,
     wave_name: str,
     max_points: int,
+    start: int = 0,
 ) -> WaveDataResult:
-    """Read 1D or 2D numeric wave metadata and values over the native pipe."""
+    """Read 1D/2D numeric or 1D text wave metadata and values over the native pipe."""
     wave_ref = {"wave": wave_name}
     try:
         exists = _pipe_call_int(client, "WaveExists", [wave_ref])
@@ -3358,21 +3741,47 @@ def _get_wave_data_via_pipe(
         3: "data-folder-reference",
         4: "wave-reference",
     }
-    if wave_class != 1:
+    is_text = wave_class == 2
+    if wave_class not in (1, 2):
         class_name = class_names.get(wave_class, f"unknown class {wave_class}")
         raise IgorError(
             f"Wave '{wave_name}' is a {class_name} wave; "
-            "only numeric waves are supported"
+            "only numeric and 1D text waves are supported"
         )
     point_count = _pipe_call_int(client, "numpnts", [wave_ref])
     dimensions = _pipe_call_int(client, "WaveDims", [wave_ref])
-    if dimensions > 2 or (dimensions == 0 and point_count > 0):
+    if is_text:
+        if dimensions > 1 or (dimensions == 0 and point_count > 0):
+            raise IgorError(
+                f"Wave '{wave_name}' is a {dimensions}D text wave; only 1D text waves are supported"
+            )
+    elif dimensions > 2 or (dimensions == 0 and point_count > 0):
         raise IgorError(
             f"Wave '{wave_name}' has {dimensions} dimensions; only 1D and 2D waves are supported"
         )
 
-    is_complex = bool(wave_type & 0x01)
     escaped_name = _igor_escape(wave_name)
+
+    if is_text:
+        count = 0 if start >= point_count else min(point_count - start, max_points)
+        text_values: list[str] = []
+        if count:
+            text_values = _export_text_wave_slice_pipe(
+                client, escaped_name, start, start + count - 1
+            )
+        return {
+            "name": wave_name,
+            "npnts": point_count,
+            "dimensions": dimensions,
+            "wave_type_code": 0,
+            "complex": False,
+            "text": True,
+            "start": start,
+            "truncated": (start + count) < point_count,
+            "values": text_values,
+        }
+
+    is_complex = bool(wave_type & 0x01)
 
     if dimensions == 2:
         num_rows = _pipe_call_int(client, "DimSize", [wave_ref, 0])
@@ -3394,14 +3803,21 @@ def _get_wave_data_via_pipe(
             or ""
         ).strip()
 
-        max_rows = max(1, max_points // max(1, num_cols)) if num_cols > 0 else 0
-        rows_to_read = min(num_rows, max_rows)
+        if start >= num_rows or num_cols <= 0 or max_points == 0:
+            rows_to_read = 0
+        else:
+            max_rows = max(1, max_points // max(1, num_cols))
+            rows_to_read = min(num_rows - start, max_rows)
         matrix_values: list[list[float | str]] = []
 
         if rows_to_read > 0 and num_cols > 0:
             format_string = "\\t".join(["%.17g"] * num_cols) + "\\n"
             lines = _export_wave_slice_pipe(
-                client, escaped_name, format_string, rows_to_read - 1
+                client,
+                escaped_name,
+                format_string,
+                start + rows_to_read - 1,
+                first_row=start,
             )
             for line_str in lines:
                 tokens = [t.strip() for t in line_str.split("\t") if t.strip()]
@@ -3421,15 +3837,22 @@ def _get_wave_data_via_pipe(
             "y_units": y_units,
             "wave_type_code": wave_type,
             "complex": is_complex,
-            "truncated": rows_to_read < num_rows,
+            "start": start,
+            "truncated": (start + rows_to_read) < num_rows,
             "values": matrix_values,
         }
 
-    count = min(point_count, max_points)
+    count = 0 if start >= point_count else min(point_count - start, max_points)
     values: list[float | str | dict[str, float | str]] = []
     if count:
         format_string = "%.17g,%.17g\\n" if is_complex else "%.17g\\n"
-        rows = _export_wave_slice_pipe(client, escaped_name, format_string, count - 1)
+        rows = _export_wave_slice_pipe(
+            client,
+            escaped_name,
+            format_string,
+            start + count - 1,
+            first_row=start,
+        )
         if len(rows) != count:
             raise IgorError(
                 f"Igor returned {len(rows)} wave rows; expected {count}"
@@ -3454,7 +3877,8 @@ def _get_wave_data_via_pipe(
         "dimensions": dimensions,
         "wave_type_code": wave_type,
         "complex": is_complex,
-        "truncated": count < point_count,
+        "start": start,
+        "truncated": (start + count) < point_count,
         "values": values,
     }
 
@@ -3463,55 +3887,83 @@ def _get_wave_data_via_pipe(
 def get_wave_data(
     wave_name: Annotated[
         str,
-        Field(description="Name or full path of a 1D or 2D numeric wave (e.g. 'root:Run_001', 'matrix0')."),
+        Field(description="Name or full path of a 1D/2D numeric wave or 1D text wave (e.g. 'root:Run_001', 'matrix0', 'labels')."),
     ],
     max_points: Annotated[
         int,
         Field(description="Maximum points (or matrix cells) to return (0 to 10,000). Defaults to 1000."),
     ] = 1000,
+    start: Annotated[
+        int,
+        Field(description="Starting point (or row) index (0-based). Defaults to 0.", ge=0),
+    ] = 0,
 ) -> WaveDataResult:
-    """Return values and metadata from a 1D or 2D numeric wave, up to 10,000 points.
+    """Return values and metadata from a 1D/2D numeric wave or 1D text wave, up to 10,000 points.
 
-    The result includes the wave's full `npnts`, dimensionality, numeric type
-    code, complex flag, scaling properties, and whether the returned values were truncated.
-    Higher-dimensional (>2D), text, wave-reference, and data-folder-reference waves
-    are rejected explicitly.
+    Supports 0-based `start` pagination (point index for 1D waves, row index for 2D waves).
+    The result includes the wave's full `npnts`, dimensionality, numeric type code, complex/text
+    flags, `start` offset, scaling properties (for 2D waves), and whether remaining data was
+    truncated. Higher-dimensional (>2D), multi-dimensional text, wave-reference, and
+    data-folder-reference waves are rejected explicitly.
     """
     if not isinstance(wave_name, str) or not wave_name.strip():
         raise IgorError("wave_name must be a non-empty wave name or full path")
     max_points = _validate_max_points(max_points)
+    start = _validate_start_index(start)
 
     mode = _transport_mode()
     if mode != "com":
-        client = _try_pipe_client(auto_start=False, timeout_seconds=2.0)
-        if client is not None:
-            try:
-                return _get_wave_data_via_pipe(client, wave_name, max_points)
-            except igor_pipe.PipeNotAvailableError as exc:
-                if mode == "pipe":
-                    raise IgorError(str(exc)) from exc
-            except igor_pipe.IgorPipeError as exc:
-                raise IgorError(str(exc)) from exc
-            finally:
-                client.close()
-        elif mode == "pipe":
-            raise IgorError(
-                "No active Igor Pro named-pipe instance found (IGOR_TRANSPORT=pipe)."
+        try:
+            used_pipe, pipe_result = _run_with_pooled_pipe(
+                lambda client: _get_wave_data_via_pipe(
+                    client, wave_name, max_points, start=start
+                ),
+                timeout_seconds=2.0,
             )
+            if used_pipe:
+                return pipe_result
+            if mode == "pipe":
+                raise IgorError(
+                    "No active Igor Pro named-pipe instance found (IGOR_TRANSPORT=pipe)."
+                )
+        except igor_pipe.PipeNotAvailableError as exc:
+            if mode == "pipe":
+                raise IgorError(str(exc)) from exc
+        except igor_pipe.IgorPipeError as exc:
+            raise IgorError(str(exc)) from exc
 
     def operation(app, version):
         escaped_name = _igor_escape(wave_name)
-        wave_type, point_count, dimensions = _validate_numeric_wave(
+        wave_type, point_count, dimensions, is_text = _validate_readable_wave(
             app, version, wave_name, escaped_name
         )
+        if is_text:
+            return _get_1d_text_wave_data(
+                app, wave_name, escaped_name, point_count, dimensions, max_points, start=start
+            )
         is_complex = bool(wave_type & 0x01)
 
         if dimensions == 2:
             return _get_2d_wave_data(
-                app, wave_name, escaped_name, wave_type, point_count, is_complex, max_points
+                app,
+                wave_name,
+                escaped_name,
+                wave_type,
+                point_count,
+                is_complex,
+                max_points,
+                start=start,
             )
         return _get_1d_wave_data(
-            app, wave_name, escaped_name, wave_type, point_count, dimensions, is_complex, max_points
+            app,
+            wave_name,
+            escaped_name,
+            wave_type,
+            point_count,
+            dimensions,
+            is_complex,
+            max_points,
+            start=start,
         )
 
     return _with_igor(operation)
@@ -3534,45 +3986,48 @@ def list_waves(
 
     mode = _transport_mode()
     if mode != "com":
-        client = _try_pipe_client(auto_start=False, timeout_seconds=2.0)
-        if client is not None:
-            try:
-                exists_resp = client.call_function(
-                    "DataFolderExists", [folder], timeout_seconds=10.0
-                )
-                raw_exists = exists_resp.get("value")
-                try:
-                    folder_exists = int(raw_exists) == 1
-                except (TypeError, ValueError):
-                    folder_exists = False
-                if not folder_exists:
-                    raise IgorError(f"Data folder '{folder}' does not exist")
-                escaped_folder = _igor_escape(folder)
-                list_resp = client.execute_command(
-                    f'fprintf 0, "%s", WaveList("*", ";", "", $"{escaped_folder}")',
-                    timeout_seconds=10.0,
-                )
-                if list_resp.get("errorCode"):
-                    raise IgorError(
-                        f"Failed to list waves in '{folder}': "
-                        f"{list_resp.get('errorMessage') or list_resp.get('errorCode')}"
-                    )
-                raw_list = str(list_resp.get("results", "") or "")
-                if len(raw_list.encode("utf-8")) > _MAX_OUTPUT_BYTES:
-                    raise IgorError("wave listing exceeded the server output limit")
-                names = [name for name in raw_list.split(";") if name.strip()]
-                return {"folder": folder, "waves": names}
-            except igor_pipe.PipeNotAvailableError as exc:
-                if mode == "pipe":
-                    raise IgorError(str(exc)) from exc
-            except igor_pipe.IgorPipeError as exc:
-                raise IgorError(str(exc)) from exc
-            finally:
-                client.close()
-        elif mode == "pipe":
-            raise IgorError(
-                "No active Igor Pro named-pipe instance found (IGOR_TRANSPORT=pipe)."
+        def _list_waves_via_pipe(client: igor_pipe.IgorPipeClient) -> dict[str, object]:
+            exists_resp = client.call_function(
+                "DataFolderExists", [folder], timeout_seconds=10.0
             )
+            raw_exists = exists_resp.get("value")
+            try:
+                folder_exists = int(raw_exists) == 1
+            except (TypeError, ValueError):
+                folder_exists = False
+            if not folder_exists:
+                raise IgorError(f"Data folder '{folder}' does not exist")
+            escaped_folder = _igor_escape(folder)
+            list_resp = client.execute_command(
+                f'fprintf 0, "%s", WaveList("*", ";", "", $"{escaped_folder}")',
+                timeout_seconds=10.0,
+            )
+            if list_resp.get("errorCode"):
+                raise IgorError(
+                    f"Failed to list waves in '{folder}': "
+                    f"{list_resp.get('errorMessage') or list_resp.get('errorCode')}"
+                )
+            raw_list = str(list_resp.get("results", "") or "")
+            if len(raw_list.encode("utf-8")) > _MAX_OUTPUT_BYTES:
+                raise IgorError("wave listing exceeded the server output limit")
+            names = [name for name in raw_list.split(";") if name.strip()]
+            return {"folder": folder, "waves": names}
+
+        try:
+            used_pipe, pipe_result = _run_with_pooled_pipe(
+                _list_waves_via_pipe, timeout_seconds=2.0
+            )
+            if used_pipe:
+                return pipe_result
+            if mode == "pipe":
+                raise IgorError(
+                    "No active Igor Pro named-pipe instance found (IGOR_TRANSPORT=pipe)."
+                )
+        except igor_pipe.PipeNotAvailableError as exc:
+            if mode == "pipe":
+                raise IgorError(str(exc)) from exc
+        except igor_pipe.IgorPipeError as exc:
+            raise IgorError(str(exc)) from exc
 
     def operation(app, version):
         escaped_folder = _igor_escape(folder)
@@ -3589,49 +4044,52 @@ def list_procedures() -> str:
     """List loaded procedure files and their user-defined functions."""
     mode = _transport_mode()
     if mode != "com":
-        client = _try_pipe_client(auto_start=False, timeout_seconds=2.0)
-        if client is not None:
-            try:
-                proc_resp = client.call_function(
-                    "WinList", ["*", ";", "WIN:128"], timeout_seconds=10.0
-                )
-                procedure_list = str(proc_resp.get("value", "") or "")
-                procedures = [
-                    procedure
-                    for procedure in procedure_list.split(";")
-                    if procedure.strip()
-                ]
-                if not procedures:
-                    return "(no procedure windows found)"
-                lines = []
-                for procedure in procedures:
-                    lines.append(f"{procedure}:")
-                    fn_resp = client.call_function(
-                        "FunctionList",
-                        ["*", ";", f"WIN:{procedure}"],
-                        timeout_seconds=10.0,
-                    )
-                    functions = str(fn_resp.get("value", "") or "")
-                    names = [name for name in functions.split(";") if name.strip()]
-                    if names:
-                        lines.extend(f"  {name}" for name in names)
-                    else:
-                        lines.append("  (no user-defined functions)")
-                result = "\n".join(lines)
-                if len(result.encode("utf-8")) > _MAX_OUTPUT_BYTES:
-                    raise IgorError("procedure listing exceeded the server output limit")
-                return result
-            except igor_pipe.PipeNotAvailableError as exc:
-                if mode == "pipe":
-                    raise IgorError(str(exc)) from exc
-            except igor_pipe.IgorPipeError as exc:
-                raise IgorError(str(exc)) from exc
-            finally:
-                client.close()
-        elif mode == "pipe":
-            raise IgorError(
-                "No active Igor Pro named-pipe instance found (IGOR_TRANSPORT=pipe)."
+        def _list_procedures_via_pipe(client: igor_pipe.IgorPipeClient) -> str:
+            proc_resp = client.call_function(
+                "WinList", ["*", ";", "WIN:128"], timeout_seconds=10.0
             )
+            procedure_list = str(proc_resp.get("value", "") or "")
+            procedures = [
+                procedure
+                for procedure in procedure_list.split(";")
+                if procedure.strip()
+            ]
+            if not procedures:
+                return "(no procedure windows found)"
+            lines = []
+            for procedure in procedures:
+                lines.append(f"{procedure}:")
+                fn_resp = client.call_function(
+                    "FunctionList",
+                    ["*", ";", f"WIN:{procedure}"],
+                    timeout_seconds=10.0,
+                )
+                functions = str(fn_resp.get("value", "") or "")
+                names = [name for name in functions.split(";") if name.strip()]
+                if names:
+                    lines.extend(f"  {name}" for name in names)
+                else:
+                    lines.append("  (no user-defined functions)")
+            result = "\n".join(lines)
+            if len(result.encode("utf-8")) > _MAX_OUTPUT_BYTES:
+                raise IgorError("procedure listing exceeded the server output limit")
+            return result
+
+        try:
+            used_pipe, pipe_result = _run_with_pooled_pipe(
+                _list_procedures_via_pipe, timeout_seconds=2.0
+            )
+            if used_pipe:
+                return pipe_result
+            if mode == "pipe":
+                raise IgorError(
+                    "No active Igor Pro named-pipe instance found (IGOR_TRANSPORT=pipe)."
+                )
+        except igor_pipe.PipeNotAvailableError as exc:
+            if mode == "pipe":
+                raise IgorError(str(exc)) from exc
+        except igor_pipe.IgorPipeError as exc:
+            raise IgorError(str(exc)) from exc
 
     def operation(app, _version):
         procedure_list = _query(app, "%s", 'WinList("*", ";", "WIN:128")')
@@ -3734,51 +4192,59 @@ def ensure_igor() -> EnsureIgorResult:
     mode = _transport_mode()
 
     if mode != "com":
-        client = _try_pipe_client(auto_start=False, timeout_seconds=1.5)
-        if client is not None:
-            try:
-                pipe_name = client.pipe_name
-                # Require the initial RPC probe to succeed before treating the pipe as live.
-                caps_resp = client.capabilities(timeout_seconds=3.0)
-                version_num, version_str, experiment = _pipe_version_and_experiment(
-                    client, caps_resp
-                )
-                if version_num is not None:
-                    _ensure_supported_igor_version(version_num)
-                return {
-                    "com_reachable": _probe_com_reachable() if mode == "auto" else False,
-                    "igor_version": version_str or "10.04",
-                    "current_experiment": experiment,
-                    "executable_path": executable_path,
-                    "source_path": _SOURCE_PATH,
-                    "transport": "pipe",
-                    "pipe_reachable": True,
-                    "pipe_name": pipe_name,
-                }
-            except igor_pipe.IgorPipeError as exc:
-                if mode == "pipe":
-                    raise IgorError(
-                        f"Igor Pro named-pipe probe failed (IGOR_TRANSPORT=pipe): {exc}"
-                    ) from exc
-            finally:
-                client.close()
+        def _probe_ensure_via_pipe(client: igor_pipe.IgorPipeClient) -> EnsureIgorResult:
+            pipe_name = client.pipe_name
+            # Require the initial RPC probe to succeed before treating the pipe as live.
+            caps_resp = client.capabilities(timeout_seconds=3.0)
+            version_num, version_str, experiment = _pipe_version_and_experiment(
+                client, caps_resp
+            )
+            if version_num is not None:
+                _ensure_supported_igor_version(version_num)
+            return {
+                "com_reachable": _probe_com_reachable() if mode == "auto" else False,
+                "igor_version": version_str or "10.04",
+                "current_experiment": experiment,
+                "executable_path": executable_path,
+                "source_path": _SOURCE_PATH,
+                "transport": "pipe",
+                "pipe_reachable": True,
+                "pipe_name": pipe_name,
+            }
+
+        try:
+            used_pipe, pipe_result = _run_with_pooled_pipe(
+                _probe_ensure_via_pipe, timeout_seconds=1.5
+            )
+            if used_pipe:
+                return pipe_result
+        except igor_pipe.IgorPipeError as exc:
+            if mode == "pipe":
+                raise IgorError(
+                    f"Igor Pro named-pipe probe failed (IGOR_TRANSPORT=pipe): {exc}"
+                ) from exc
 
     def operation(app, version):
         experiment = _query(app, "%s", "IgorInfo(1)").strip()
         pipe_reachable = False
         pipe_name: str | None = None
         if mode != "com":
-            pipe_client = _try_pipe_client(auto_start=False, timeout_seconds=1.0)
-            if pipe_client is not None:
-                try:
-                    pipe_client.capabilities(timeout_seconds=2.0)
+            def _probe_pipe_after_start(
+                pipe_client: igor_pipe.IgorPipeClient,
+            ) -> str | None:
+                pipe_client.capabilities(timeout_seconds=2.0)
+                return pipe_client.pipe_name
+
+            try:
+                used_pipe, probed_name = _run_with_pooled_pipe(
+                    _probe_pipe_after_start, timeout_seconds=1.0
+                )
+                if used_pipe:
                     pipe_reachable = True
-                    pipe_name = pipe_client.pipe_name
-                except igor_pipe.IgorPipeError:
-                    pipe_reachable = False
-                    pipe_name = None
-                finally:
-                    pipe_client.close()
+                    pipe_name = probed_name
+            except igor_pipe.IgorPipeError:
+                pipe_reachable = False
+                pipe_name = None
         return {
             "com_reachable": True,
             "igor_version": f"{version:.2f}",
@@ -3849,73 +4315,76 @@ def igor_status() -> IgorStatusResult:
     """
     mode = _transport_mode()
     if mode != "com":
-        client = _try_pipe_client(auto_start=False, timeout_seconds=1.5)
-        if client is not None:
-            try:
-                pipe_name = client.pipe_name
-                # Require the initial RPC probe to succeed before reporting pipe_reachable=True.
-                caps_resp = client.capabilities(timeout_seconds=3.0)
-                pipe_capabilities = _pipe_capabilities_list(caps_resp)
-                version_num, version_str, experiment = _pipe_version_and_experiment(
-                    client, caps_resp
-                )
-                compatible = (
-                    version_num >= _MIN_IGOR_VERSION
-                    if version_num is not None
-                    else True
-                )
-                return {
-                    "com_reachable": _probe_com_reachable() if mode == "auto" else False,
-                    "compatible": compatible,
-                    "igor_version": version_str or None,
-                    "minimum_igor_version": f"{_MIN_IGOR_VERSION:.1f}",
-                    "current_experiment": experiment,
-                    "capture_mode": "native JSON-RPC pipe",
-                    "source_path": _SOURCE_PATH,
-                    "portable_object_name_limit": _MAX_IGOR_OBJECT_NAME_LENGTH,
-                    "error": None if compatible else (
-                        f"Igor Pro {_MIN_IGOR_VERSION:.1f} or newer is required"
-                    ),
-                    "transport": "pipe",
-                    "pipe_reachable": True,
-                    "pipe_name": pipe_name,
-                    "pipe_capabilities": pipe_capabilities,
-                }
-            except igor_pipe.IgorPipeError as exc:
-                if mode == "pipe":
-                    return {
-                        "com_reachable": False,
-                        "compatible": False,
-                        "igor_version": None,
-                        "minimum_igor_version": f"{_MIN_IGOR_VERSION:.1f}",
-                        "current_experiment": None,
-                        "capture_mode": _capture_mode,
-                        "source_path": _SOURCE_PATH,
-                        "portable_object_name_limit": _MAX_IGOR_OBJECT_NAME_LENGTH,
-                        "error": str(exc),
-                        "transport": "none",
-                        "pipe_reachable": False,
-                        "pipe_name": None,
-                        "pipe_capabilities": None,
-                    }
-            finally:
-                client.close()
-        elif mode == "pipe":
+        def _status_via_pipe(client: igor_pipe.IgorPipeClient) -> IgorStatusResult:
+            pipe_name = client.pipe_name
+            # Require the initial RPC probe to succeed before reporting pipe_reachable=True.
+            caps_resp = client.capabilities(timeout_seconds=3.0)
+            pipe_capabilities = _pipe_capabilities_list(caps_resp)
+            version_num, version_str, experiment = _pipe_version_and_experiment(
+                client, caps_resp
+            )
+            compatible = (
+                version_num >= _MIN_IGOR_VERSION
+                if version_num is not None
+                else True
+            )
             return {
-                "com_reachable": False,
-                "compatible": False,
-                "igor_version": None,
+                "com_reachable": _probe_com_reachable() if mode == "auto" else False,
+                "compatible": compatible,
+                "igor_version": version_str or None,
                 "minimum_igor_version": f"{_MIN_IGOR_VERSION:.1f}",
-                "current_experiment": None,
-                "capture_mode": _capture_mode,
+                "current_experiment": experiment,
+                "capture_mode": "native JSON-RPC pipe",
                 "source_path": _SOURCE_PATH,
                 "portable_object_name_limit": _MAX_IGOR_OBJECT_NAME_LENGTH,
-                "error": "No active Igor Pro named-pipe instance found (IGOR_TRANSPORT=pipe).",
-                "transport": "none",
-                "pipe_reachable": False,
-                "pipe_name": None,
-                "pipe_capabilities": None,
+                "error": None if compatible else (
+                    f"Igor Pro {_MIN_IGOR_VERSION:.1f} or newer is required"
+                ),
+                "transport": "pipe",
+                "pipe_reachable": True,
+                "pipe_name": pipe_name,
+                "pipe_capabilities": pipe_capabilities,
             }
+
+        try:
+            used_pipe, pipe_result = _run_with_pooled_pipe(
+                _status_via_pipe, timeout_seconds=1.5
+            )
+            if used_pipe:
+                return pipe_result
+            if mode == "pipe":
+                return {
+                    "com_reachable": False,
+                    "compatible": False,
+                    "igor_version": None,
+                    "minimum_igor_version": f"{_MIN_IGOR_VERSION:.1f}",
+                    "current_experiment": None,
+                    "capture_mode": _capture_mode,
+                    "source_path": _SOURCE_PATH,
+                    "portable_object_name_limit": _MAX_IGOR_OBJECT_NAME_LENGTH,
+                    "error": "No active Igor Pro named-pipe instance found (IGOR_TRANSPORT=pipe).",
+                    "transport": "none",
+                    "pipe_reachable": False,
+                    "pipe_name": None,
+                    "pipe_capabilities": None,
+                }
+        except igor_pipe.IgorPipeError as exc:
+            if mode == "pipe":
+                return {
+                    "com_reachable": False,
+                    "compatible": False,
+                    "igor_version": None,
+                    "minimum_igor_version": f"{_MIN_IGOR_VERSION:.1f}",
+                    "current_experiment": None,
+                    "capture_mode": _capture_mode,
+                    "source_path": _SOURCE_PATH,
+                    "portable_object_name_limit": _MAX_IGOR_OBJECT_NAME_LENGTH,
+                    "error": str(exc),
+                    "transport": "none",
+                    "pipe_reachable": False,
+                    "pipe_name": None,
+                    "pipe_capabilities": None,
+                }
 
     def operation(app, version):
         experiment = _query(app, "%s", "IgorInfo(1)").strip()
@@ -4467,70 +4936,73 @@ def capture_window(
 
     mode = _transport_mode()
     if mode != "com":
-        client = _try_pipe_client(auto_start=False, timeout_seconds=2.0)
-        if client is not None:
-            try:
-                resp = client.capture_window(
-                    window=window,
-                    render=render,
-                    max_dimension=max_dimension,
-                    fmt=fmt,
-                )
-                b64_png = resp.get("data") or resp.get("image") or resp.get("png")
-                if not isinstance(b64_png, str) or not b64_png.strip():
-                    return _capture_window_error(
-                        "Igor pipe window capture returned no base64 PNG data.",
-                        transport="pipe",
-                    )
-                b64_png = b64_png.strip()
-                try:
-                    raw_bytes = base64.b64decode(b64_png, validate=True)
-                except Exception as exc:
-                    return _capture_window_error(
-                        f"Igor pipe window capture returned invalid base64 data: {exc}",
-                        transport="pipe",
-                    )
-                if not raw_bytes or len(raw_bytes) > _MAX_CAPTURE_IMAGE_BYTES:
-                    return _capture_window_error(
-                        "Captured PNG image is empty or exceeds the 20 MB limit.",
-                        transport="pipe",
-                    )
-                png_width, png_height = _png_dimensions(raw_bytes)
-                width = resp.get("width")
-                if width is None:
-                    width = png_width
-                height = resp.get("height")
-                if height is None:
-                    height = png_height
-                meta: dict[str, object] = {
-                    "ok": True,
-                    "window": resp.get("window", window),
-                    "width": width,
-                    "height": height,
-                    "format": fmt,
-                    "render": resp.get("render", render),
-                    "byte_length": len(raw_bytes),
-                    "transport": "pipe",
-                }
-                return CallToolResult(
-                    content=[
-                        TextContent(type="text", text=json.dumps(meta)),
-                        ImageContent(type="image", data=b64_png, mimeType="image/png"),
-                    ],
-                    structuredContent=meta,
-                )
-            except igor_pipe.PipeNotAvailableError as exc:
-                if mode == "pipe":
-                    return _capture_window_error(str(exc), transport="pipe")
-            except igor_pipe.IgorPipeError as exc:
-                return _capture_window_error(str(exc), transport="pipe")
-            finally:
-                client.close()
-        elif mode == "pipe":
-            return _capture_window_error(
-                "No active Igor Pro named-pipe instance found (IGOR_TRANSPORT=pipe).",
-                transport="pipe",
+        def _capture_via_pipe(client: igor_pipe.IgorPipeClient) -> CallToolResult:
+            resp = client.capture_window(
+                window=window,
+                render=render,
+                max_dimension=max_dimension,
+                fmt=fmt,
             )
+            b64_png = resp.get("data") or resp.get("image") or resp.get("png")
+            if not isinstance(b64_png, str) or not b64_png.strip():
+                return _capture_window_error(
+                    "Igor pipe window capture returned no base64 PNG data.",
+                    transport="pipe",
+                )
+            b64_png = b64_png.strip()
+            try:
+                raw_bytes = base64.b64decode(b64_png, validate=True)
+            except Exception as exc:
+                return _capture_window_error(
+                    f"Igor pipe window capture returned invalid base64 data: {exc}",
+                    transport="pipe",
+                )
+            if not raw_bytes or len(raw_bytes) > _MAX_CAPTURE_IMAGE_BYTES:
+                return _capture_window_error(
+                    "Captured PNG image is empty or exceeds the 20 MB limit.",
+                    transport="pipe",
+                )
+            png_width, png_height = _png_dimensions(raw_bytes)
+            width = resp.get("width")
+            if width is None:
+                width = png_width
+            height = resp.get("height")
+            if height is None:
+                height = png_height
+            meta: dict[str, object] = {
+                "ok": True,
+                "window": resp.get("window", window),
+                "width": width,
+                "height": height,
+                "format": fmt,
+                "render": resp.get("render", render),
+                "byte_length": len(raw_bytes),
+                "transport": "pipe",
+            }
+            return CallToolResult(
+                content=[
+                    TextContent(type="text", text=json.dumps(meta)),
+                    ImageContent(type="image", data=b64_png, mimeType="image/png"),
+                ],
+                structuredContent=meta,
+            )
+
+        try:
+            used_pipe, pipe_result = _run_with_pooled_pipe(
+                _capture_via_pipe, timeout_seconds=2.0
+            )
+            if used_pipe:
+                return pipe_result
+            if mode == "pipe":
+                return _capture_window_error(
+                    "No active Igor Pro named-pipe instance found (IGOR_TRANSPORT=pipe).",
+                    transport="pipe",
+                )
+        except igor_pipe.PipeNotAvailableError as exc:
+            if mode == "pipe":
+                return _capture_window_error(str(exc), transport="pipe")
+        except igor_pipe.IgorPipeError as exc:
+            return _capture_window_error(str(exc), transport="pipe")
 
     def com_operation(app, _version):
         target_win = window.strip() if isinstance(window, str) and window.strip() else ""
@@ -4689,15 +5161,7 @@ def call_function(
         _command_worker_lock.release()
 
     def direct() -> dict[str, object]:
-        client = _try_pipe_client(auto_start=False, timeout_seconds=2.0)
-        if client is None:
-            return _failed_call_function_result(
-                "call_function requires an active Igor Pro 10.04+ native JSON-RPC named-pipe connection.",
-                command_started=False,
-                outcome_known=True,
-                transport="none",
-            )
-        try:
+        def _invoke_via_pipe(client: igor_pipe.IgorPipeClient) -> dict[str, object]:
             before = _igor_dialogs()
             if before:
                 comp_errors = _capture_compilation_errors(before, phase="before_command")
@@ -4720,15 +5184,14 @@ def call_function(
                     kwargs=kwargs,
                     timeout_seconds=clamped_timeout,
                 )
-            except igor_pipe.PipeNotAvailableError as exc:
-                return _failed_call_function_result(
-                    str(exc),
-                    command_started=False,
-                    outcome_known=True,
-                    transport="pipe",
-                )
+            except igor_pipe.PipeNotAvailableError:
+                if marker is not None:
+                    marker.clear()
+                raise
             except igor_pipe.PipeDispatchError as exc:
                 # Covers PipeTimeoutError and post-dispatch disconnect: never replay.
+                with suppress(Exception):
+                    client.close()
                 elapsed = round(time.monotonic() - t0, 4)
                 dialogs = _igor_dialogs()
                 comp_errors = _capture_compilation_errors(dialogs, phase="after_command")
@@ -4764,8 +5227,26 @@ def call_function(
                 "outcome_known": True,
                 "error": None,
             }
-        finally:
-            client.close()
+
+        try:
+            used_pipe, pipe_result = _run_with_pooled_pipe(
+                _invoke_via_pipe, timeout_seconds=2.0
+            )
+            if used_pipe:
+                return pipe_result
+            return _failed_call_function_result(
+                "call_function requires an active Igor Pro 10.04+ native JSON-RPC named-pipe connection.",
+                command_started=False,
+                outcome_known=True,
+                transport="none",
+            )
+        except igor_pipe.PipeNotAvailableError as exc:
+            return _failed_call_function_result(
+                str(exc),
+                command_started=False,
+                outcome_known=True,
+                transport="pipe",
+            )
 
     try:
         return _run_igor_operation_in_worker_locked(
@@ -4981,22 +5462,16 @@ def close_procedure(
         _command_worker_lock.release()
 
     def direct() -> dict[str, object]:
-        client = _try_pipe_client(auto_start=False, timeout_seconds=2.0)
-        if client is None:
-            return {
-                "ok": False,
-                "closed": [],
-                "reopened": [],
-                "not_closed": list(file_paths),
-                "compile": None,
-                "transport": "none",
-                "error": "close_procedure requires an active Igor Pro 10.04+ native JSON-RPC named-pipe connection.",
-            }
-        try:
+        def _close_via_pipe(client: igor_pipe.IgorPipeClient) -> dict[str, object]:
             marker = getattr(_command_start_marker, "event", None)
             if marker is not None:
                 marker.set()
-            resp = client.close_procedures(file_paths, timeout_seconds=30.0)
+            try:
+                resp = client.close_procedures(file_paths, timeout_seconds=30.0)
+            except igor_pipe.PipeNotAvailableError:
+                if marker is not None:
+                    marker.clear()
+                raise
             return {
                 "ok": True,
                 "closed": resp.get("closed", []),
@@ -5006,10 +5481,24 @@ def close_procedure(
                 "transport": "pipe",
                 "error": None,
             }
+
+        try:
+            used_pipe, pipe_result = _run_with_pooled_pipe(
+                _close_via_pipe, timeout_seconds=2.0
+            )
+            if used_pipe:
+                return pipe_result
+            return {
+                "ok": False,
+                "closed": [],
+                "reopened": [],
+                "not_closed": list(file_paths),
+                "compile": None,
+                "transport": "none",
+                "error": "close_procedure requires an active Igor Pro 10.04+ native JSON-RPC named-pipe connection.",
+            }
         except igor_pipe.IgorPipeError as exc:
             return failure_factory(str(exc))
-        finally:
-            client.close()
 
     try:
         return _run_igor_operation_in_worker_locked(
@@ -5065,15 +5554,17 @@ def compile_procedures() -> dict[str, object]:
 
         def direct_pipe() -> dict[str, object] | None:
             nonlocal pipe_unavailable
-            client = _try_pipe_client(auto_start=False, timeout_seconds=2.0)
-            if client is None:
-                pipe_unavailable = True
-                return None
-            try:
+
+            def _compile_via_pipe(client: igor_pipe.IgorPipeClient) -> dict[str, object]:
                 marker = getattr(_command_start_marker, "event", None)
                 if marker is not None:
                     marker.set()
-                resp = client.compile_procedures(timeout_seconds=30.0)
+                try:
+                    resp = client.compile_procedures(timeout_seconds=30.0)
+                except igor_pipe.PipeNotAvailableError:
+                    if marker is not None:
+                        marker.clear()
+                    raise
                 raw_errors = resp.get("errors")
                 errors = list(raw_errors) if isinstance(raw_errors, list) else []
                 singular_error = resp.get("error")
@@ -5092,18 +5583,22 @@ def compile_procedures() -> dict[str, object]:
                     "transport": "pipe",
                     "error": singular_error,
                 }
+
+            try:
+                used_pipe, pipe_result = _run_with_pooled_pipe(
+                    _compile_via_pipe, timeout_seconds=2.0
+                )
+                if used_pipe:
+                    return pipe_result
+                pipe_unavailable = True
+                return None
             except igor_pipe.PipeNotAvailableError as exc:
-                marker = getattr(_command_start_marker, "event", None)
-                if marker is not None:
-                    marker.clear()
                 if mode == "pipe":
                     return failure_factory(str(exc))
                 pipe_unavailable = True
                 return None
             except igor_pipe.IgorPipeError as exc:
                 return failure_factory(str(exc))
-            finally:
-                client.close()
 
         try:
             pipe_res = _run_igor_operation_in_worker_locked(
@@ -5155,37 +5650,42 @@ def get_compile_status() -> dict[str, object]:
     """
     mode = _transport_mode()
     if mode != "com":
-        client = _try_pipe_client(auto_start=False, timeout_seconds=2.0)
-        if client is not None:
-            try:
-                resp = client.get_compile_status(timeout_seconds=10.0)
-                compiled = resp.get("compiled")
-                needs_compile = resp.get(
-                    "needsCompile", resp.get("needs_compile")
-                )
-                if needs_compile is None and isinstance(compiled, bool):
-                    needs_compile = not compiled
+        def _compile_status_via_pipe(client: igor_pipe.IgorPipeClient) -> dict[str, object]:
+            resp = client.get_compile_status(timeout_seconds=10.0)
+            compiled = resp.get("compiled")
+            needs_compile = resp.get(
+                "needsCompile", resp.get("needs_compile")
+            )
+            if needs_compile is None and isinstance(compiled, bool):
+                needs_compile = not compiled
+            return {
+                "ok": True,
+                "compiled": compiled,
+                "needs_compile": needs_compile,
+                "compilation_errors": resp.get("errors", []),
+                "details": resp,
+                "transport": "pipe",
+                "error": None,
+            }
+
+        try:
+            used_pipe, pipe_result = _run_with_pooled_pipe(
+                _compile_status_via_pipe, timeout_seconds=2.0
+            )
+            if used_pipe:
+                return pipe_result
+            if mode == "pipe":
                 return {
-                    "ok": True,
-                    "compiled": compiled,
-                    "needs_compile": needs_compile,
-                    "compilation_errors": resp.get("errors", []),
-                    "details": resp,
+                    "ok": False,
+                    "compiled": None,
+                    "needs_compile": None,
+                    "compilation_errors": [],
+                    "details": None,
                     "transport": "pipe",
-                    "error": None,
+                    "error": "No active Igor Pro named-pipe instance found (IGOR_TRANSPORT=pipe).",
                 }
-            except igor_pipe.PipeNotAvailableError as exc:
-                if mode == "pipe":
-                    return {
-                        "ok": False,
-                        "compiled": None,
-                        "needs_compile": None,
-                        "compilation_errors": [],
-                        "details": None,
-                        "transport": "pipe",
-                        "error": str(exc),
-                    }
-            except igor_pipe.IgorPipeError as exc:
+        except igor_pipe.PipeNotAvailableError as exc:
+            if mode == "pipe":
                 return {
                     "ok": False,
                     "compiled": None,
@@ -5195,9 +5695,7 @@ def get_compile_status() -> dict[str, object]:
                     "transport": "pipe",
                     "error": str(exc),
                 }
-            finally:
-                client.close()
-        elif mode == "pipe":
+        except igor_pipe.IgorPipeError as exc:
             return {
                 "ok": False,
                 "compiled": None,
@@ -5205,7 +5703,7 @@ def get_compile_status() -> dict[str, object]:
                 "compilation_errors": [],
                 "details": None,
                 "transport": "pipe",
-                "error": "No active Igor Pro named-pipe instance found (IGOR_TRANSPORT=pipe).",
+                "error": str(exc),
             }
 
     compiler_dialogs = _compilation_error_dialogs()
@@ -5269,29 +5767,32 @@ def list_windows(
 
     mode = _transport_mode()
     if mode != "com":
-        client = _try_pipe_client(auto_start=False, timeout_seconds=2.0)
-        if client is not None:
-            try:
-                resp = client.call_function(
-                    "WinList", [pattern, ";", options], timeout_seconds=10.0
-                )
-                raw_list = str(resp.get("value", "") or "")
-                windows = [w for w in raw_list.split(";") if w.strip()]
-                return {
-                    "ok": True,
-                    "windows": windows,
-                    "count": len(windows),
-                    "transport": "pipe",
-                }
-            except igor_pipe.PipeNotAvailableError as exc:
-                if mode == "pipe":
-                    raise IgorError(str(exc)) from exc
-            except igor_pipe.IgorPipeError as exc:
+        def _list_windows_via_pipe(client: igor_pipe.IgorPipeClient) -> dict[str, object]:
+            resp = client.call_function(
+                "WinList", [pattern, ";", options], timeout_seconds=10.0
+            )
+            raw_list = str(resp.get("value", "") or "")
+            windows = [w for w in raw_list.split(";") if w.strip()]
+            return {
+                "ok": True,
+                "windows": windows,
+                "count": len(windows),
+                "transport": "pipe",
+            }
+
+        try:
+            used_pipe, pipe_result = _run_with_pooled_pipe(
+                _list_windows_via_pipe, timeout_seconds=2.0
+            )
+            if used_pipe:
+                return pipe_result
+            if mode == "pipe":
+                raise IgorError("No active Igor Pro named-pipe instance found (IGOR_TRANSPORT=pipe).")
+        except igor_pipe.PipeNotAvailableError as exc:
+            if mode == "pipe":
                 raise IgorError(str(exc)) from exc
-            finally:
-                client.close()
-        elif mode == "pipe":
-            raise IgorError("No active Igor Pro named-pipe instance found (IGOR_TRANSPORT=pipe).")
+        except igor_pipe.IgorPipeError as exc:
+            raise IgorError(str(exc)) from exc
 
     def operation(app, _version):
         raw_list = _query(
@@ -5313,50 +5814,53 @@ def get_experiment_info() -> dict[str, object]:
     """Return the current Igor Pro experiment name, filename, folder path, and saved flag."""
     mode = _transport_mode()
     if mode != "com":
-        client = _try_pipe_client(auto_start=False, timeout_seconds=2.0)
-        if client is not None:
-            try:
-                name = str(
-                    client.call_function("IgorInfo", [1], timeout_seconds=10.0).get(
-                        "value", ""
+        def _exp_info_via_pipe(client: igor_pipe.IgorPipeClient) -> dict[str, object]:
+            name = str(
+                client.call_function("IgorInfo", [1], timeout_seconds=10.0).get(
+                    "value", ""
+                )
+                or ""
+            ).strip()
+            file_name = str(
+                client.call_function("IgorInfo", [12], timeout_seconds=10.0).get(
+                    "value", ""
+                )
+                or ""
+            ).strip()
+            folder_path = ""
+            if file_name:
+                path_resp = client.execute_command(
+                    'PathInfo home; fprintf 0, "%s", ParseFilePath(5, S_path, "*", 0, 0)',
+                    timeout_seconds=10.0,
+                )
+                if path_resp.get("errorCode"):
+                    raise IgorError(
+                        f"Failed to resolve experiment home path: "
+                        f"{path_resp.get('errorMessage') or path_resp.get('errorCode')}"
                     )
-                    or ""
-                ).strip()
-                file_name = str(
-                    client.call_function("IgorInfo", [12], timeout_seconds=10.0).get(
-                        "value", ""
-                    )
-                    or ""
-                ).strip()
-                folder_path = ""
-                if file_name:
-                    path_resp = client.execute_command(
-                        'PathInfo home; fprintf 0, "%s", ParseFilePath(5, S_path, "*", 0, 0)',
-                        timeout_seconds=10.0,
-                    )
-                    if path_resp.get("errorCode"):
-                        raise IgorError(
-                            f"Failed to resolve experiment home path: "
-                            f"{path_resp.get('errorMessage') or path_resp.get('errorCode')}"
-                        )
-                    folder_path = str(path_resp.get("results", "") or "").strip()
-                return {
-                    "ok": True,
-                    "name": name or "(untitled)",
-                    "file_name": file_name,
-                    "path": folder_path,
-                    "saved": bool(file_name),
-                    "transport": "pipe",
-                }
-            except igor_pipe.PipeNotAvailableError as exc:
-                if mode == "pipe":
-                    raise IgorError(str(exc)) from exc
-            except igor_pipe.IgorPipeError as exc:
+                folder_path = str(path_resp.get("results", "") or "").strip()
+            return {
+                "ok": True,
+                "name": name or "(untitled)",
+                "file_name": file_name,
+                "path": folder_path,
+                "saved": bool(file_name),
+                "transport": "pipe",
+            }
+
+        try:
+            used_pipe, pipe_result = _run_with_pooled_pipe(
+                _exp_info_via_pipe, timeout_seconds=2.0
+            )
+            if used_pipe:
+                return pipe_result
+            if mode == "pipe":
+                raise IgorError("No active Igor Pro named-pipe instance found (IGOR_TRANSPORT=pipe).")
+        except igor_pipe.PipeNotAvailableError as exc:
+            if mode == "pipe":
                 raise IgorError(str(exc)) from exc
-            finally:
-                client.close()
-        elif mode == "pipe":
-            raise IgorError("No active Igor Pro named-pipe instance found (IGOR_TRANSPORT=pipe).")
+        except igor_pipe.IgorPipeError as exc:
+            raise IgorError(str(exc)) from exc
 
     def operation(app, _version):
         name = _query(app, "%s", "IgorInfo(1)").strip()
@@ -5384,74 +5888,77 @@ def get_system_information() -> dict[str, object]:
     """Return Igor Pro version/platform info, OS/CPU info, Qt version, loaded XOPs, and thread count."""
     mode = _transport_mode()
     if mode != "com":
-        client = _try_pipe_client(auto_start=False, timeout_seconds=2.0)
-        if client is not None:
+        def _sys_info_via_pipe(client: igor_pipe.IgorPipeClient) -> dict[str, object]:
+            info0 = str(
+                client.call_function("IgorInfo", [0], timeout_seconds=10.0).get(
+                    "value", ""
+                )
+                or ""
+            ).strip()
+            info3 = str(
+                client.call_function("IgorInfo", [3], timeout_seconds=10.0).get(
+                    "value", ""
+                )
+                or ""
+            ).strip()
+            qt_version = str(
+                client.call_function("IgorInfo", [6], timeout_seconds=10.0).get(
+                    "value", ""
+                )
+                or ""
+            ).strip()
+            xops_raw = str(
+                client.call_function("IgorInfo", [10], timeout_seconds=10.0).get(
+                    "value", ""
+                )
+                or ""
+            ).strip()
             try:
-                info0 = str(
-                    client.call_function("IgorInfo", [0], timeout_seconds=10.0).get(
-                        "value", ""
+                proc_val = client.call_function(
+                    "ThreadProcessorCount", [], timeout_seconds=10.0
+                ).get("value")
+            except igor_pipe.PipeRPCError:
+                proc_resp = client.execute_command(
+                    'fprintf 0, "%d", ThreadProcessorCount',
+                    timeout_seconds=10.0,
+                )
+                if proc_resp.get("errorCode"):
+                    raise IgorError(
+                        f"Failed to query ThreadProcessorCount: "
+                        f"{proc_resp.get('errorMessage') or proc_resp.get('errorCode')}"
                     )
-                    or ""
-                ).strip()
-                info3 = str(
-                    client.call_function("IgorInfo", [3], timeout_seconds=10.0).get(
-                        "value", ""
-                    )
-                    or ""
-                ).strip()
-                qt_version = str(
-                    client.call_function("IgorInfo", [6], timeout_seconds=10.0).get(
-                        "value", ""
-                    )
-                    or ""
-                ).strip()
-                xops_raw = str(
-                    client.call_function("IgorInfo", [10], timeout_seconds=10.0).get(
-                        "value", ""
-                    )
-                    or ""
-                ).strip()
-                try:
-                    proc_val = client.call_function(
-                        "ThreadProcessorCount", [], timeout_seconds=10.0
-                    ).get("value")
-                except igor_pipe.PipeRPCError:
-                    proc_resp = client.execute_command(
-                        'fprintf 0, "%d", ThreadProcessorCount',
-                        timeout_seconds=10.0,
-                    )
-                    if proc_resp.get("errorCode"):
-                        raise IgorError(
-                            f"Failed to query ThreadProcessorCount: "
-                            f"{proc_resp.get('errorMessage') or proc_resp.get('errorCode')}"
-                        )
-                    proc_val = str(proc_resp.get("results", "") or "").strip()
-                proc_count: int | str | None
-                if isinstance(proc_val, (int, float)) and not isinstance(proc_val, bool):
-                    proc_count = int(proc_val)
-                elif isinstance(proc_val, str) and proc_val.strip().isdigit():
-                    proc_count = int(proc_val.strip())
-                else:
-                    proc_count = proc_val
-                loaded_xops = [x.strip() for x in xops_raw.split(";") if x.strip()]
-                return {
-                    "ok": True,
-                    "igor_info": info0,
-                    "system_info": info3,
-                    "qt_version": qt_version,
-                    "loaded_xops": loaded_xops,
-                    "thread_processor_count": proc_count,
-                    "transport": "pipe",
-                }
-            except igor_pipe.PipeNotAvailableError as exc:
-                if mode == "pipe":
-                    raise IgorError(str(exc)) from exc
-            except igor_pipe.IgorPipeError as exc:
+                proc_val = str(proc_resp.get("results", "") or "").strip()
+            proc_count: int | str | None
+            if isinstance(proc_val, (int, float)) and not isinstance(proc_val, bool):
+                proc_count = int(proc_val)
+            elif isinstance(proc_val, str) and proc_val.strip().isdigit():
+                proc_count = int(proc_val.strip())
+            else:
+                proc_count = proc_val
+            loaded_xops = [x.strip() for x in xops_raw.split(";") if x.strip()]
+            return {
+                "ok": True,
+                "igor_info": info0,
+                "system_info": info3,
+                "qt_version": qt_version,
+                "loaded_xops": loaded_xops,
+                "thread_processor_count": proc_count,
+                "transport": "pipe",
+            }
+
+        try:
+            used_pipe, pipe_result = _run_with_pooled_pipe(
+                _sys_info_via_pipe, timeout_seconds=2.0
+            )
+            if used_pipe:
+                return pipe_result
+            if mode == "pipe":
+                raise IgorError("No active Igor Pro named-pipe instance found (IGOR_TRANSPORT=pipe).")
+        except igor_pipe.PipeNotAvailableError as exc:
+            if mode == "pipe":
                 raise IgorError(str(exc)) from exc
-            finally:
-                client.close()
-        elif mode == "pipe":
-            raise IgorError("No active Igor Pro named-pipe instance found (IGOR_TRANSPORT=pipe).")
+        except igor_pipe.IgorPipeError as exc:
+            raise IgorError(str(exc)) from exc
 
     def operation(app, _version):
         info0 = _query(app, "%s", "IgorInfo(0)").strip()
@@ -5824,27 +6331,28 @@ def inspect_experiment(
 
     mode = _transport_mode()
     if mode != "com":
-        client = _try_pipe_client(auto_start=False, timeout_seconds=2.0)
-        if client is not None:
-            try:
-                return _inspect_experiment_via_pipe(
+        try:
+            used_pipe, pipe_result = _run_with_pooled_pipe(
+                lambda client: _inspect_experiment_via_pipe(
                     client,
                     root_folder=normalized_root,
                     max_depth=clamped_depth,
                     max_folders=clamped_folders,
                     include_wave_names=include_wave_names,
-                )
-            except igor_pipe.PipeNotAvailableError as exc:
-                if mode == "pipe":
-                    raise IgorError(str(exc)) from exc
-            except igor_pipe.IgorPipeError as exc:
-                raise IgorError(str(exc)) from exc
-            finally:
-                client.close()
-        elif mode == "pipe":
-            raise IgorError(
-                "No active Igor Pro named-pipe instance found (IGOR_TRANSPORT=pipe)."
+                ),
+                timeout_seconds=2.0,
             )
+            if used_pipe:
+                return pipe_result
+            if mode == "pipe":
+                raise IgorError(
+                    "No active Igor Pro named-pipe instance found (IGOR_TRANSPORT=pipe)."
+                )
+        except igor_pipe.PipeNotAvailableError as exc:
+            if mode == "pipe":
+                raise IgorError(str(exc)) from exc
+        except igor_pipe.IgorPipeError as exc:
+            raise IgorError(str(exc)) from exc
 
     return _with_igor(
         lambda app, _version: _inspect_experiment_via_com(

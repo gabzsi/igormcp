@@ -357,6 +357,7 @@ class IgorPipeClient:
     ) -> None:
         self._configured_pipe_name = pipe_name
         self._pipe_name: str | None = pipe_name
+        self._pid: int | None = None
         self._instances_path = instances_path
         self._version_prefix = version_prefix
         self._default_timeout = float(default_timeout)
@@ -369,6 +370,10 @@ class IgorPipeClient:
     @property
     def pipe_name(self) -> str | None:
         return self._pipe_name
+
+    @property
+    def pid(self) -> int | None:
+        return self._pid
 
     @property
     def is_connected(self) -> bool:
@@ -391,12 +396,14 @@ class IgorPipeClient:
             raise PipeNotAvailableError("Connection timeout must be positive.")
 
         pipe_name = self._configured_pipe_name
+        discovered_pid: int | None = None
         if not pipe_name:
             instance = select_instance(
                 instances_path=self._instances_path,
                 version_prefix=self._version_prefix,
             )
             pipe_name = instance.pipe
+            discovered_pid = instance.pid
         pipe_name = normalize_pipe_name(pipe_name)
 
         deadline = time.monotonic() + timeout
@@ -412,6 +419,7 @@ class IgorPipeClient:
                     None,
                 )
                 self._pipe_name = pipe_name
+                self._pid = discovered_pid
                 self._handle = handle
                 self._read_buffer.clear()
                 return
@@ -446,6 +454,7 @@ class IgorPipeClient:
         """Close the named pipe handle if open."""
         handle = self._handle
         self._handle = None
+        self._pid = None
         self._read_buffer.clear()
         if handle is not None:
             try:

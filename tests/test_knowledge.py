@@ -239,6 +239,90 @@ class PublicKnowledgeBundleTests(unittest.TestCase):
             finally:
                 knowledge.clear_cache()
 
+    def test_posting_index_bounded_lru_and_edge_case_equivalence(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            root = Path(scratch).resolve()
+            (root / "official").mkdir()
+            (root / "curated").mkdir()
+            docs = []
+            payloads = [
+                ("guides/g1.md", "curated/g1.md", "guides", "Guide One",
+                 "# Guide One\n\nUse SetScale/P and += for scaling.\n\n## Details\nMyCurveFitWrapper example.\n"),
+                ("manuals/m1.md", "official/m1.md", "manuals", "CurveFit Reference",
+                 "# CurveFit Reference\n\n## CurveFit\nCurveFit performs nonlinear curve fitting.\n"),
+                ("manuals/m2.md", "official/m2.md", "manuals", "Graph Display",
+                 "# Graph Display\n\n## Display\nDisplay waveA creates a graph window.\n"),
+                ("manuals/m3.md", "official/m3.md", "manuals", "Tie Alpha",
+                 "# Tie Alpha\n\nSharedTieToken exact paragraph.\n"),
+                ("manuals/m4.md", "official/m4.md", "manuals", "Tie Beta",
+                 "# Tie Beta\n\nSharedTieToken exact paragraph.\n"),
+            ]
+            for doc_id, rel_path, coll, title, text in payloads:
+                raw = text.encode("utf-8")
+                target = root / rel_path
+                target.write_bytes(raw)
+                docs.append(
+                    {
+                        "id": doc_id,
+                        "path": rel_path,
+                        "collection": coll,
+                        "title": title,
+                        "bundle_sha256": hashlib.sha256(raw).hexdigest().upper(),
+                    }
+                )
+            (root / "manifest.json").write_text(json.dumps({"documents": docs}), encoding="utf-8")
+
+            try:
+                with (
+                    patch.object(knowledge, "_KNOWLEDGE_DIR", root),
+                    patch.object(knowledge, "_MAX_CACHED_DOCS", 2),
+                ):
+                    # Search guides first, then manuals, exercising incremental posting merge.
+                    r_guide = knowledge.search("SetScale/P", collection="guides")
+                    self.assertEqual(r_guide["results_count"], 1)
+                    self.assertEqual(r_guide["results"][0]["document_id"], "guides/g1.md")
+
+                    # Substring inside compound identifier (MyCurveFitWrapper) still matches.
+                    r_sub = knowledge.search("CurveFit", collection="guides")
+                    self.assertEqual(r_sub["results_count"], 1)
+                    self.assertEqual(r_sub["results"][0]["document_id"], "guides/g1.md")
+
+                    # Now search manuals + all (merges manual postings with existing guide postings).
+                    r_all = knowledge.search("CurveFit", collection="all", max_results=5)
+                    self.assertEqual(
+                        [r["document_id"] for r in r_all["results"]],
+                        ["manuals/m1.md", "guides/g1.md"],
+                    )
+
+                    # Punctuation-only and single-char fallback queries work cleanly.
+                    r_punct = knowledge.search("+=", collection="all")
+                    self.assertEqual(r_punct["results"][0]["document_id"], "guides/g1.md")
+                    r_short = knowledge.search("a", collection="all")
+                    self.assertGreaterEqual(r_short["results_count"], 1)
+
+                    # Deterministic tie-breaking on equal scores (m3 < m4).
+                    r_tie = knowledge.search("SharedTieToken", collection="manuals", max_results=1)
+                    self.assertEqual(r_tie["results"][0]["document_id"], "manuals/m3.md")
+
+                    # Topic filter.
+                    r_topic = knowledge.search("Display", topic="graph", collection="manuals")
+                    self.assertEqual(r_topic["results_count"], 1)
+                    self.assertEqual(r_topic["results"][0]["document_id"], "manuals/m2.md")
+
+                    # Bounded LRU cache never exceeds _MAX_CACHED_DOCS.
+                    index = knowledge._get_index()
+                    self.assertLessEqual(len(index.entries), 2)
+
+                    # Tampering with a hashed file in-place raises hash mismatch on next search.
+                    tampered = root / "official" / "m2.md"
+                    tampered.write_bytes(b"# Graph Display\n\nTampered content.\n")
+                    bumped = os.stat(tampered).st_mtime + 2.0
+                    os.utime(tampered, (bumped, bumped))
+                    with self.assertRaisesRegex(RuntimeError, "hash mismatch"):
+                        knowledge.search("Display", collection="manuals")
+            finally:
+                knowledge.clear_cache()
+
 
 if __name__ == "__main__":
     unittest.main()

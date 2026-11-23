@@ -8,12 +8,15 @@ paths supplied by a caller.  This keeps document identifiers stable and makes
 
 from __future__ import annotations
 
+from array import array
+from collections import OrderedDict, defaultdict
 from dataclasses import dataclass
 import hashlib
 import json
 import os
 import re
 import stat
+import sys
 import threading
 from pathlib import Path, PurePosixPath
 from typing import Any, NamedTuple
@@ -33,6 +36,8 @@ _DEFAULT_MAX_CHARS = 20_000
 _MAX_READ_CHARS = 200_000
 _MAX_EXCERPT_CHARS = 700
 _MAX_CACHED_ROOTS = 8
+_MAX_CACHED_DOCS = 64
+_MAX_CACHED_BYTES = 1_000_000
 _KNOWLEDGE_TIERS = frozenset({"core-reference", "on-demand"})
 _HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*#*\s*$")
 _PARAGRAPH_SEPARATOR_RE = re.compile(r"(?:\r?\n)[ \t]*(?:\r?\n)+")
@@ -41,6 +46,7 @@ _COMMAND_RE = re.compile(
 )
 _COMMAND_ROOT_RE = re.compile(r"[A-Za-z]+")
 _TERM_RE = re.compile(r"[A-Za-z0-9_]+")
+_POSTING_TOKEN_RE = re.compile(r"[a-z0-9_]{2,}")
 
 
 class _IndexedSection(NamedTuple):
@@ -51,10 +57,26 @@ class _IndexedSection(NamedTuple):
     read_offset: int
 
 
-@dataclass
+class _DocumentMeta(NamedTuple):
+    doc_idx: int
+    document_id: str
+    document_id_folded: str
+    path: str
+    file_sig: tuple[int, int]
+    expected_hash: str
+    collection: Any
+    knowledge_tier: str
+    file_stem: str
+    title: str
+    title_folded: str
+    source_path: Any
+    topic_haystack: str
+
+
+@dataclass(slots=True)
 class _IndexedDocument:
     document_id: str
-    path: Path
+    path: str
     file_sig: tuple[int, int]
     expected_hash: str
     collection: Any
@@ -65,7 +87,6 @@ class _IndexedDocument:
     source_path: Any
     topic_haystack: str
     text: str
-    full_folded: str
     sections: tuple[_IndexedSection, ...] | None = None
 
 
@@ -87,32 +108,59 @@ class _KnowledgeIndex:
         self.manifest = manifest
         self.documents = documents
         self.document_by_id = {document["id"]: document for document in documents}
-        self.entries: dict[str, _IndexedDocument] = {}
+        self._doc_count = len(documents)
+        self._posting_typecode = "H" if self._doc_count <= 0xFFFF else "I"
+        self._postings_shift = max(20, (self._doc_count + 1).bit_length())
+        self._metas: list[_DocumentMeta | None] = [None] * self._doc_count
+        self._postings_flat: array = array(self._posting_typecode)
+        self._postings_spans: dict[str, int] = {}
+        self._heading_postings_flat: array = array(self._posting_typecode)
+        self._heading_postings_spans: dict[str, int] = {}
+        self._updated_doc_indices: set[int] = set()
+        self._collection_indices: dict[str, tuple[int, ...]] = {
+            "all": tuple(range(self._doc_count)),
+            "manuals": tuple(
+                idx for idx, doc in enumerate(documents) if doc.get("collection") == "manuals"
+            ),
+            "guides": tuple(
+                idx for idx, doc in enumerate(documents) if doc.get("collection") == "guides"
+            ),
+        }
+        self._collection_sets: dict[str, frozenset[int]] = {
+            "manuals": frozenset(self._collection_indices["manuals"]),
+            "guides": frozenset(self._collection_indices["guides"]),
+        }
+        self.entries: OrderedDict[str, _IndexedDocument] = OrderedDict()
+        self._cached_bytes = 0
         self.stats_hits = 0
         self.stats_misses = 0
 
-    def collection_documents(self, collection: object) -> tuple[dict[str, Any], ...]:
+    def normalize_collection(self, collection: object) -> str:
         if collection is None:
-            return self.documents
+            return "all"
         if not isinstance(collection, str):
             raise ValueError("collection must be 'manuals', 'guides', or 'all'")
         normalized = collection.strip().lower()
         if normalized == "all":
-            return self.documents
+            return "all"
         aliases = {"official": "manuals", "curated": "guides"}
         normalized = aliases.get(normalized, normalized)
         if normalized not in {"manuals", "guides"}:
             raise ValueError("collection must be 'manuals', 'guides', or 'all'")
-        return tuple(
-            document for document in self.documents if document.get("collection") == normalized
-        )
+        return normalized
+
+    def collection_documents(self, collection: object) -> tuple[dict[str, Any], ...]:
+        normalized = self.normalize_collection(collection)
+        if normalized == "all":
+            return self.documents
+        return tuple(self.documents[idx] for idx in self._collection_indices[normalized])
 
 
 _INDEX_LOCK = threading.RLock()
 _INDEX_CACHE: dict[Path, _KnowledgeIndex] = {}
 
 
-def _stat_signature(path: Path) -> tuple[int, int]:
+def _stat_signature(path: Path | str) -> tuple[int, int]:
     st = os.stat(path)
     return (st.st_mtime_ns, st.st_size)
 
@@ -300,10 +348,223 @@ def _resolve_document_record(index: _KnowledgeIndex, document_id: str) -> dict[s
     return index.document_by_id.get(document_id)
 
 
-def _get_entry(index: _KnowledgeIndex, document: dict[str, Any]) -> _IndexedDocument:
-    document_id = str(document["id"])
+def _expected_hash(document: dict[str, Any]) -> str:
     raw_expected_hash = document.get("bundle_sha256")
-    expected_hash = raw_expected_hash.upper() if isinstance(raw_expected_hash, str) and raw_expected_hash else ""
+    return raw_expected_hash.upper() if isinstance(raw_expected_hash, str) and raw_expected_hash else ""
+
+
+def _load_document_payload(
+    index: _KnowledgeIndex,
+    document: dict[str, Any],
+) -> tuple[str, tuple[int, int], str, str, str]:
+    document_id = str(document["id"])
+    expected_hash = _expected_hash(document)
+    path = _safe_document_path(document_id, document, root=index.root)
+    path_str = os.fspath(path)
+    file_sig = _stat_signature(path_str)
+    raw = path.read_bytes()
+    if expected_hash:
+        actual_hash = hashlib.sha256(raw).hexdigest().upper()
+        if actual_hash != expected_hash:
+            raise RuntimeError(f"Bundled knowledge hash mismatch: {document_id}")
+    text = raw.decode("utf-8")
+    title = _document_title(document, text)
+    return path_str, file_sig, expected_hash, text, title
+
+
+def _build_entry_and_meta(
+    doc_idx: int,
+    document: dict[str, Any],
+    path_str: str,
+    file_sig: tuple[int, int],
+    expected_hash: str,
+    text: str,
+    title: str,
+) -> tuple[_DocumentMeta, _IndexedDocument]:
+    document_id = str(document["id"])
+    title_folded = title.casefold()
+    source_path = document.get("source_path")
+    collection = document.get("collection")
+    tier = _knowledge_tier(document)
+    file_stem = Path(str(document["path"])).stem
+    topic_haystack = (document_id + " " + title + " " + str(source_path or "")).casefold()
+    meta = _DocumentMeta(
+        doc_idx=doc_idx,
+        document_id=document_id,
+        document_id_folded=document_id.casefold(),
+        path=path_str,
+        file_sig=file_sig,
+        expected_hash=expected_hash,
+        collection=collection,
+        knowledge_tier=tier,
+        file_stem=file_stem,
+        title=title,
+        title_folded=title_folded,
+        source_path=source_path,
+        topic_haystack=topic_haystack,
+    )
+    entry = _IndexedDocument(
+        document_id=document_id,
+        path=path_str,
+        file_sig=file_sig,
+        expected_hash=expected_hash,
+        collection=collection,
+        knowledge_tier=tier,
+        file_stem=file_stem,
+        title=title,
+        title_folded=title_folded,
+        source_path=source_path,
+        topic_haystack=topic_haystack,
+        text=text,
+    )
+    return meta, entry
+
+
+def _put_entry_locked(index: _KnowledgeIndex, entry: _IndexedDocument) -> None:
+    existing = index.entries.pop(entry.document_id, None)
+    if existing is not None:
+        index._cached_bytes -= sys.getsizeof(existing.text)
+    index.entries[entry.document_id] = entry
+    index._cached_bytes += sys.getsizeof(entry.text)
+    while len(index.entries) > _MAX_CACHED_DOCS or (
+        len(index.entries) > 1 and index._cached_bytes > _MAX_CACHED_BYTES
+    ):
+        _evicted_id, evicted = index.entries.popitem(last=False)
+        index._cached_bytes -= sys.getsizeof(evicted.text)
+
+
+def _merge_postings_arrays(
+    old_flat: array,
+    old_spans: dict[str, int],
+    new_postings: dict[str, array],
+    *,
+    typecode: str,
+    shift: int,
+) -> tuple[array, dict[str, int]]:
+    if not new_postings:
+        return old_flat, old_spans
+    if not old_spans:
+        flat = array(typecode)
+        spans: dict[str, int] = {}
+        for tok in list(new_postings.keys()):
+            docs = new_postings.pop(tok)
+            start = len(flat)
+            flat.extend(docs)
+            spans[tok] = (start << shift) | len(docs)
+        return flat, spans
+
+    mask = (1 << shift) - 1
+    merged_flat = array(typecode)
+    merged_spans: dict[str, int] = {}
+    for tok, packed in old_spans.items():
+        start = packed >> shift
+        count = packed & mask
+        new_start = len(merged_flat)
+        merged_flat.extend(old_flat[start : start + count])
+        extra = new_postings.pop(tok, None)
+        if extra is not None:
+            merged_flat.extend(extra)
+            count += len(extra)
+        merged_spans[tok] = (new_start << shift) | count
+    for tok in list(new_postings.keys()):
+        docs = new_postings.pop(tok)
+        new_start = len(merged_flat)
+        merged_flat.extend(docs)
+        merged_spans[tok] = (new_start << shift) | len(docs)
+    return merged_flat, merged_spans
+
+
+def _ensure_indexed(index: _KnowledgeIndex, doc_indices: tuple[int, ...]) -> set[int]:
+    """Ensure metadata and posting index are built and fresh for ``doc_indices``."""
+
+    loaded_this_call: set[int] = set()
+    if not doc_indices:
+        return loaded_this_call
+
+    with _INDEX_LOCK:
+        metas = index._metas
+        unindexed: list[int] = []
+        stale: list[int] = []
+        for idx in doc_indices:
+            meta = metas[idx]
+            if meta is None:
+                unindexed.append(idx)
+                continue
+            try:
+                current_sig = _stat_signature(meta.path)
+            except OSError:
+                current_sig = None
+            if current_sig != meta.file_sig:
+                stale.append(idx)
+
+        if unindexed:
+            typecode = index._posting_typecode
+            new_postings: dict[str, array] = defaultdict(lambda: array(typecode))
+            new_heading_postings: dict[str, array] = defaultdict(lambda: array(typecode))
+            cache_during_scan = len(unindexed) <= _MAX_CACHED_DOCS
+            for idx in unindexed:
+                document = index.documents[idx]
+                path_str, file_sig, expected_hash, text, title = _load_document_payload(
+                    index, document
+                )
+                meta, entry = _build_entry_and_meta(
+                    idx, document, path_str, file_sig, expected_hash, text, title
+                )
+                metas[idx] = meta
+                folded = meta.title_folded + " " + text.casefold()
+                for tok in set(_POSTING_TOKEN_RE.findall(folded)):
+                    new_postings[tok].append(idx)
+                heading_parts: list[str] = []
+                for line in text.splitlines():
+                    match = _HEADING_RE.match(line.strip())
+                    if match:
+                        heading_parts.append(match.group(2).strip())
+                if heading_parts:
+                    headings_folded = " ".join(heading_parts).casefold()
+                    for tok in set(_POSTING_TOKEN_RE.findall(headings_folded)):
+                        new_heading_postings[tok].append(idx)
+                index.stats_misses += 1
+                if cache_during_scan:
+                    _put_entry_locked(index, entry)
+                    loaded_this_call.add(idx)
+            index._postings_flat, index._postings_spans = _merge_postings_arrays(
+                index._postings_flat,
+                index._postings_spans,
+                new_postings,
+                typecode=typecode,
+                shift=index._postings_shift,
+            )
+            index._heading_postings_flat, index._heading_postings_spans = _merge_postings_arrays(
+                index._heading_postings_flat,
+                index._heading_postings_spans,
+                new_heading_postings,
+                typecode=typecode,
+                shift=index._postings_shift,
+            )
+
+        for idx in stale:
+            document = index.documents[idx]
+            path_str, file_sig, expected_hash, text, title = _load_document_payload(index, document)
+            meta, entry = _build_entry_and_meta(
+                idx, document, path_str, file_sig, expected_hash, text, title
+            )
+            metas[idx] = meta
+            index._updated_doc_indices.add(idx)
+            _put_entry_locked(index, entry)
+            index.stats_misses += 1
+            loaded_this_call.add(idx)
+
+    return loaded_this_call
+
+
+def _get_entry(
+    index: _KnowledgeIndex,
+    document: dict[str, Any],
+    *,
+    count_hit: bool = True,
+) -> _IndexedDocument:
+    document_id = str(document["id"])
+    expected_hash = _expected_hash(document)
 
     with _INDEX_LOCK:
         cached = index.entries.get(document_id)
@@ -315,18 +576,13 @@ def _get_entry(index: _KnowledgeIndex, document: dict[str, Any]) -> _IndexedDocu
             current_sig = None
         if current_sig == cached.file_sig:
             with _INDEX_LOCK:
-                index.stats_hits += 1
+                if document_id in index.entries:
+                    index.entries.move_to_end(document_id)
+                if count_hit:
+                    index.stats_hits += 1
             return cached
 
-    path = _safe_document_path(document_id, document, root=index.root)
-    file_sig = _stat_signature(path)
-    raw = path.read_bytes()
-    if expected_hash:
-        actual_hash = hashlib.sha256(raw).hexdigest().upper()
-        if actual_hash != expected_hash:
-            raise RuntimeError(f"Bundled knowledge hash mismatch: {document_id}")
-    text = raw.decode("utf-8")
-    title = _document_title(document, text)
+    path, file_sig, expected_hash, text, title = _load_document_payload(index, document)
     title_folded = title.casefold()
     source_path = document.get("source_path")
     entry = _IndexedDocument(
@@ -342,10 +598,9 @@ def _get_entry(index: _KnowledgeIndex, document: dict[str, Any]) -> _IndexedDocu
         source_path=source_path,
         topic_haystack=(document_id + " " + title + " " + str(source_path or "")).casefold(),
         text=text,
-        full_folded=title_folded + " " + text.casefold(),
     )
     with _INDEX_LOCK:
-        index.entries[document_id] = entry
+        _put_entry_locked(index, entry)
         index.stats_misses += 1
     return entry
 
@@ -495,6 +750,182 @@ def _score(query: str, title: str, heading: str, block: str) -> int:
     return score
 
 
+def _postings_lookup_locked(
+    spans: dict[str, int],
+    flat: array,
+    shift: int,
+    term: str,
+) -> set[int]:
+    mask = (1 << shift) - 1
+    docs: set[int] = set()
+    for tok, packed in spans.items():
+        if term in tok:
+            start = packed >> shift
+            count = packed & mask
+            docs.update(flat[start : start + count])
+    return docs
+
+
+def _candidate_doc_indices(
+    index: _KnowledgeIndex,
+    canonical_collection: str,
+    terms: tuple[str, ...],
+) -> tuple[tuple[int, ...] | set[int], dict[str, set[int]]]:
+    """Return ``(candidate_indices, heading_docs_by_term)`` for ``terms``."""
+
+    if not terms:
+        return index._collection_indices[canonical_collection], {}
+
+    unique_terms = tuple(dict.fromkeys(terms))
+    with _INDEX_LOCK:
+        spans = index._postings_spans
+        flat = index._postings_flat
+        h_spans = index._heading_postings_spans
+        h_flat = index._heading_postings_flat
+        shift = index._postings_shift
+        updated = set(index._updated_doc_indices)
+
+        matched: set[int] | None = None
+        for term in unique_terms:
+            term_docs = _postings_lookup_locked(spans, flat, shift, term)
+            if matched is None:
+                matched = term_docs
+            else:
+                matched &= term_docs
+            if not matched:
+                break
+
+        heading_docs_by_term: dict[str, set[int]] = {}
+        if matched or updated:
+            for term in unique_terms:
+                heading_docs_by_term[term] = _postings_lookup_locked(h_spans, h_flat, shift, term)
+
+    result: set[int] = matched if matched is not None else set()
+    if updated:
+        result |= updated
+    if canonical_collection != "all":
+        result &= index._collection_sets[canonical_collection]
+    return result, heading_docs_by_term
+
+
+def _best_section_in_text(
+    text: str,
+    *,
+    title_folded: str,
+    title_score: int,
+    query_folded: str,
+    terms: tuple[str, ...],
+    remaining_terms: tuple[str, ...],
+    exact_re: re.Pattern[str] | None,
+) -> tuple[int, str, str, str, int] | None:
+    """Find the highest-scoring paragraph in ``text`` without allocating all sections."""
+
+    blocks: list[tuple[str, int, int]] = []
+    heading = ""
+    block_start = 0
+    cursor = 0
+    for line in text.splitlines(keepends=True):
+        line_content = line.rstrip("\r\n")
+        match = _HEADING_RE.match(line_content.strip())
+        if match:
+            if text[block_start:cursor].strip():
+                blocks.append((heading, block_start, cursor))
+            heading = match.group(2).strip()
+            block_start = cursor + len(line)
+        cursor += len(line)
+    if text[block_start:len(text)].strip():
+        blocks.append((heading, block_start, len(text)))
+
+    best_score = 0
+    best_section_folded = ""
+    best_heading = ""
+    best_block: str | None = None
+    best_read_offset = 0
+
+    for section_heading, start, end in blocks:
+        heading_folded = section_heading.casefold()
+        section_text = text[start:end]
+        block_terms_needed = tuple(term for term in remaining_terms if term not in heading_folded)
+        if block_terms_needed:
+            section_text_folded = section_text.casefold()
+            if any(term not in section_text_folded for term in block_terms_needed):
+                continue
+
+        heading_score = title_score
+        if query_folded == heading_folded:
+            heading_score += 150
+        elif query_folded in heading_folded:
+            heading_score += 85
+        for term in terms:
+            if term in heading_folded:
+                heading_count = heading_folded.count(term)
+                heading_score += 12 * (2 if heading_count >= 2 else heading_count)
+
+        section_folded = heading_folded or title_folded
+        paragraph_start = 0
+        for separator in _PARAGRAPH_SEPARATOR_RE.finditer(section_text):
+            paragraph = section_text[paragraph_start:separator.start()]
+            trimmed = paragraph.strip()
+            if trimmed:
+                block_folded = trimmed.casefold()
+                if not block_terms_needed or not any(
+                    term not in block_folded for term in block_terms_needed
+                ):
+                    score = heading_score
+                    if exact_re is not None and exact_re.search(trimmed) is not None:
+                        score += 120
+                    if query_folded in block_folded:
+                        score += 45
+                    for term in terms:
+                        if term in block_folded:
+                            block_count = block_folded.count(term)
+                            score += 3 * (2 if block_count >= 2 else block_count)
+                    if score > 0 and (
+                        best_block is None
+                        or score > best_score
+                        or (score == best_score and section_folded < best_section_folded)
+                    ):
+                        leading_whitespace = len(paragraph) - len(paragraph.lstrip())
+                        best_score = score
+                        best_section_folded = section_folded
+                        best_heading = section_heading
+                        best_block = trimmed
+                        best_read_offset = start + paragraph_start + leading_whitespace
+            paragraph_start = separator.end()
+
+        paragraph = section_text[paragraph_start:]
+        trimmed = paragraph.strip()
+        if trimmed:
+            block_folded = trimmed.casefold()
+            if not block_terms_needed or not any(
+                term not in block_folded for term in block_terms_needed
+            ):
+                score = heading_score
+                if exact_re is not None and exact_re.search(trimmed) is not None:
+                    score += 120
+                if query_folded in block_folded:
+                    score += 45
+                for term in terms:
+                    if term in block_folded:
+                        block_count = block_folded.count(term)
+                        score += 3 * (2 if block_count >= 2 else block_count)
+                if score > 0 and (
+                    best_block is None
+                    or score > best_score
+                    or (score == best_score and section_folded < best_section_folded)
+                ):
+                    leading_whitespace = len(paragraph) - len(paragraph.lstrip())
+                    best_score = score
+                    best_section_folded = section_folded
+                    best_heading = section_heading
+                    best_block = trimmed
+                    best_read_offset = start + paragraph_start + leading_whitespace
+
+    if best_block is None:
+        return None
+    return (best_score, best_section_folded, best_heading, best_block, best_read_offset)
+
+
 def search(
     query: str,
     topic: str | None = None,
@@ -516,7 +947,7 @@ def search(
             max_results, label="max_results", default=3, maximum=_MAX_RESULTS
         )
         index = _get_index()
-        documents = index.collection_documents(collection)
+        canonical_collection = index.normalize_collection(collection)
     except ValueError as exc:
         return {
             "query": query if isinstance(query, str) else "",
@@ -526,6 +957,9 @@ def search(
             "error": str(exc),
             "results": [],
         }
+
+    doc_indices = index._collection_indices[canonical_collection]
+    loaded_this_call = _ensure_indexed(index, doc_indices)
 
     query_folded = cleaned_query.casefold()
     topic_folded = cleaned_topic.casefold() if cleaned_topic else None
@@ -542,20 +976,23 @@ def search(
         else None
     )
 
-    best_per_document: list[tuple[int, str, str, _IndexedDocument, _IndexedSection]] = []
+    candidate_indices, heading_docs_by_term = _candidate_doc_indices(
+        index, canonical_collection, terms
+    )
+    metas = index._metas
+    updated_indices = index._updated_doc_indices
+    max_block_bonus = (120 if exact_re is not None else 0) + 45 + 6 * len(terms)
+    full_heading_bonus = 150 + 24 * len(terms)
 
-    for document in documents:
-        entry = _get_entry(index, document)
-        if topic_folded and topic_folded not in entry.topic_haystack:
+    scored_candidates: list[tuple[int, int, str, int]] = []
+    for doc_idx in candidate_indices:
+        meta = metas[doc_idx]
+        if meta is None:
+            continue
+        if topic_folded and topic_folded not in meta.topic_haystack:
             continue
 
-        if terms:
-            if any(term not in entry.full_folded for term in terms):
-                continue
-        elif not is_command and query_folded not in entry.full_folded:
-            continue
-
-        title_folded = entry.title_folded
+        title_folded = meta.title_folded
         title_score = 0
         if query_folded == title_folded:
             title_score += 160
@@ -569,57 +1006,77 @@ def search(
             if "what's new" in title_folded or "what's changed" in title_folded:
                 title_score -= 180
 
-        remaining_terms = tuple(term for term in terms if term not in title_folded)
-        best_score = 0
-        best_section_folded = ""
-        best_section: _IndexedSection | None = None
-
-        for section in _get_sections(entry):
-            heading_folded = section.heading_folded
-            block_folded = section.block_folded
-            if remaining_terms and any(
-                term not in heading_folded and term not in block_folded
-                for term in remaining_terms
-            ):
-                continue
-
-            score = title_score
-            if query_folded == heading_folded:
-                score += 150
-            elif query_folded in heading_folded:
-                score += 85
-            if exact_re is not None and exact_re.search(section.block) is not None:
-                score += 120
-            if query_folded in block_folded:
-                score += 45
+        if not terms or doc_idx in updated_indices:
+            heading_bonus = full_heading_bonus
+        else:
+            all_terms_in_heading = True
+            heading_term_bonus = 0
             for term in terms:
-                if term in heading_folded:
-                    heading_count = heading_folded.count(term)
-                    score += 12 * (2 if heading_count >= 2 else heading_count)
-                if term in block_folded:
-                    block_count = block_folded.count(term)
-                    score += 3 * (2 if block_count >= 2 else block_count)
-            if score <= 0:
+                if doc_idx in heading_docs_by_term[term]:
+                    heading_term_bonus += 24
+                else:
+                    all_terms_in_heading = False
+            heading_bonus = (150 if all_terms_in_heading else 0) + heading_term_bonus
+
+        max_possible_score = title_score + heading_bonus + max_block_bonus
+        if max_possible_score <= 0:
+            continue
+        scored_candidates.append((max_possible_score, title_score, meta.document_id_folded, doc_idx))
+
+    scored_candidates.sort(key=lambda item: (-item[0], item[2]))
+
+    best_per_document: list[tuple[int, str, str, _IndexedDocument, str, str, int]] = []
+    top_keys: list[tuple[int, str]] = []
+
+    for max_possible_score, title_score, doc_id_folded, doc_idx in scored_candidates:
+        if len(top_keys) >= result_limit:
+            kth_score, kth_doc_id = top_keys[-1]
+            if max_possible_score < kth_score or (
+                max_possible_score == kth_score and doc_id_folded > kth_doc_id
+            ):
+                break
+
+        document = index.documents[doc_idx]
+        entry = _get_entry(index, document, count_hit=(doc_idx not in loaded_this_call))
+
+        if doc_idx in updated_indices or not terms:
+            full_folded = entry.title_folded + " " + entry.text.casefold()
+            if terms:
+                if any(term not in full_folded for term in terms):
+                    continue
+            elif not is_command and query_folded not in full_folded:
                 continue
 
-            section_folded = heading_folded or title_folded
-            if best_section is None or score > best_score or (
-                score == best_score and section_folded < best_section_folded
-            ):
-                best_score = score
-                best_section_folded = section_folded
-                best_section = section
-
-        if best_section is not None:
+        title_folded = entry.title_folded
+        remaining_terms = tuple(term for term in terms if term not in title_folded)
+        match_result = _best_section_in_text(
+            entry.text,
+            title_folded=title_folded,
+            title_score=title_score,
+            query_folded=query_folded,
+            terms=terms,
+            remaining_terms=remaining_terms,
+            exact_re=exact_re,
+        )
+        if match_result is not None:
+            best_score, best_section_folded, best_heading, best_block, best_read_offset = (
+                match_result
+            )
             best_per_document.append(
                 (
                     best_score,
-                    entry.document_id.casefold(),
+                    doc_id_folded,
                     best_section_folded,
                     entry,
-                    best_section,
+                    best_heading,
+                    best_block,
+                    best_read_offset,
                 )
             )
+            top_keys.append((best_score, doc_id_folded))
+            top_keys.sort(key=lambda item: (-item[0], item[1]))
+            if len(top_keys) > result_limit:
+                top_keys.pop()
 
     best_per_document.sort(key=lambda item: (-item[0], item[1], item[2]))
     top_results = [
@@ -629,18 +1086,22 @@ def search(
             "knowledge_tier": entry.knowledge_tier,
             "file": entry.file_stem,
             "title": entry.title,
-            "section": section.heading or entry.title,
+            "section": best_heading or entry.title,
             "score": score,
-            "excerpt": _excerpt(section.block, cleaned_query),
-            "read_offset": section.read_offset,
+            "excerpt": _excerpt(best_block, cleaned_query),
+            "read_offset": best_read_offset,
             "source_path": entry.source_path,
         }
-        for score, _doc_id_folded, _section_folded, entry, section in best_per_document[:result_limit]
+        for (
+            score,
+            _doc_id_folded,
+            _section_folded,
+            entry,
+            best_heading,
+            best_block,
+            best_read_offset,
+        ) in best_per_document[:result_limit]
     ]
-    canonical_collection = "all" if collection is None else str(collection).strip().lower()
-    canonical_collection = {"official": "manuals", "curated": "guides"}.get(
-        canonical_collection, canonical_collection
-    )
     return {
         "query": cleaned_query,
         "topic": cleaned_topic,
