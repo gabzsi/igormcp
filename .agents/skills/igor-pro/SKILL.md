@@ -15,6 +15,7 @@ Use this skill whenever a task involves Igor Pro. Route all Igor operations thro
 - Search prior session memory only when repeating a nontrivial workflow or looking for a relevant workaround; skip elementary one-offs. Read useful matches with `read_session_memory`.
 - Prefer direct `execute_igor` commands for simple calculations, plots, fitting, inspection, and short command sequences. Use an IPF procedure for ODE simulations, instrument control, batch or loop-heavy processing across multiple datasets, reusable routines, or an explicit user request. Data size alone does not call for an IPF when a built-in command handles the work simply.
 - Prefer `call_function` for direct typed return values over `Print`; use `inspect_experiment` for a single-shot overview of folders, waves, and windows, `capture_window` to visually verify plots, `compile_procedures` for silent `.ipf` reload/compile, and `abort_igor` to cancel hung server commands.
+- When the user asks to understand their workflow or opens a `.pxp` with custom procedures or styled graphs, call `profile_workflow` (set `save_profile=True` to build up and incrementally merge a reusable workflow profile across experiments) and use `read_procedure` to inspect specific procedure functions.
 - Use initialize guidance for elementary commands; do not enumerate or pre-read basic-reference pages as a task preflight. Use local MCP knowledge tools for uncertain syntax, unfamiliar operations, or unresolved diagnostics. Never use web search, a browser, HTTP fetch, or external sites to look up Igor documentation. If the local knowledge bundle lacks needed details, report the gap and ask the user rather than falling back online. The installer/updater download is a separate installation workflow, not task-time lookup. Search curated guides when a project-specific workflow is relevant, then read the useful match with `read_igor_document`.
 - Combine short, dependent commands when that keeps one requested operation clear. Avoid unrelated mutations. Do not export figures unless the user requests files.
 
@@ -53,8 +54,9 @@ Use `query_igor_help` for local details on Make, NewDataFolder, SetScale, Waves,
 | `abort_igor` | Cancel a hung or long-running server command. |
 | `capture_window` | Capture an Igor window image to visually verify plots. |
 | `inspect_experiment` | Single-shot read-only overview of experiment metadata, bounded data-folder tree, wave names, and open windows without changing the active folder. |
+| `profile_workflow` | Read-only workflow profile of folders, procedure outlines, and graph style conventions; set `save_profile=True` to persist and incrementally merge across experiments. |
 | `list_waves`, `get_wave_data`, `read_variable`, `list_windows`, `get_experiment_info`, `get_system_information`, `get_igor_state` | Inspect open experiment data, windows, system info, and live Igor state. |
-| `list_procedures`, `open_procedure`, `close_procedure`, `compile_procedures`, `get_compile_status` | List, open, close, and silently compile `.ipf` procedures. |
+| `list_procedures`, `read_procedure`, `open_procedure`, `close_procedure`, `compile_procedures`, `get_compile_status` | List, read paginated source lines, open, close, and silently compile `.ipf` procedures. |
 | `import_delimited_text` | Import supported numeric CSV, TSV, or TXT data. |
 | `get_igor_dialogs`, `get_igor_compilation_errors` | Inspect visible dialogs and compiler diagnostics. |
 | `dismiss_igor_dialogs`, `dismiss_igor_compilation_errors` | Close dialogs after reviewing the relevant result. |

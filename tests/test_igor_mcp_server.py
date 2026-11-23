@@ -734,6 +734,8 @@ class ValidationTests(unittest.TestCase):
             "get_experiment_info",
             "get_system_information",
             "inspect_experiment",
+            "read_procedure",
+            "profile_workflow",
         })
         self.assertTrue(tools["query_igor_help"].annotations.readOnlyHint)
         self.assertFalse(tools["query_igor_help"].annotations.destructiveHint)
@@ -769,6 +771,8 @@ class ValidationTests(unittest.TestCase):
             "get_experiment_info",
             "get_system_information",
             "inspect_experiment",
+            "read_procedure",
+            "profile_workflow",
         ):
             self.assertTrue(tools[name].annotations.readOnlyHint)
             self.assertFalse(tools[name].annotations.destructiveHint)
@@ -1885,8 +1889,8 @@ class HybridPipeAndNewToolsTests(unittest.TestCase):
         with patch.dict(os.environ, {"IGOR_TOOL_PROFILE": "core"}):
             core_names = asyncio.run(_list_names())
 
-        self.assertEqual(len(full_names), 34)
-        self.assertEqual(len(core_names), 31)
+        self.assertEqual(len(full_names), 36)
+        self.assertEqual(len(core_names), 33)
         for report_tool in ("create_html_report", "open_report_graph", "apply_html_report"):
             self.assertIn(report_tool, full_names)
             self.assertNotIn(report_tool, core_names)
@@ -2048,7 +2052,7 @@ class HybridPipeAndNewToolsTests(unittest.TestCase):
                 server.list_windows(match=bad_match)
 
     def test_quick_polish_server_info_version_and_call_function_schema_docs(self):
-        self.assertEqual(server.mcp._mcp_server.version, "0.4.0")
+        self.assertEqual(server.mcp._mcp_server.version, "0.5.0")
 
         async def _check_wire():
             async with create_connected_server_and_client_session(server.mcp) as client:
@@ -2057,7 +2061,7 @@ class HybridPipeAndNewToolsTests(unittest.TestCase):
                 return init, tools
 
         init_result, tools_result = asyncio.run(_check_wire())
-        self.assertEqual(init_result.serverInfo.version, "0.4.0")
+        self.assertEqual(init_result.serverInfo.version, "0.5.0")
 
         call_fn_tool = next(t for t in tools_result.tools if t.name == "call_function")
         args_desc = call_fn_tool.inputSchema["properties"]["args"]["description"]
@@ -3026,6 +3030,305 @@ class WavePaginationAndTextWaveTests(unittest.TestCase):
         ):
             with self.assertRaisesRegex(server.IgorError, "data-folder-reference"):
                 server.get_wave_data("root:dfref")
+
+    def test_read_procedure_pipe_com_pagination_and_validation(self):
+        proc_sources = {
+            "MyAnalysis.ipf": "line0\r\nline1\r\nline2\rline3\nline4",
+            "EmptyProc.ipf": "",
+        }
+
+        class _ProcPipeClient(_FakePipeClient):
+            def call_function(self, name, args=None, kwargs=None, timeout_seconds=30.0):
+                self.calls.append(("call_function", name, args, kwargs, timeout_seconds))
+                if name == "ProcedureText":
+                    return {"type": "string", "value": proc_sources.get(args[2], "")}
+                if name == "WinList":
+                    return {
+                        "type": "string",
+                        "value": ";".join(proc_sources.keys()) + ";",
+                    }
+                return {"type": "string", "value": ""}
+
+        # Pipe full read + pagination
+        with (
+            patch.object(server, "_try_pipe_client", return_value=_ProcPipeClient()),
+            patch.object(server, "_with_igor") as com_call,
+        ):
+            first = server.read_procedure("MyAnalysis.ipf", start_line=0, max_lines=2)
+            second = server.read_procedure("MyAnalysis.ipf", start_line=2, max_lines=10)
+            empty = server.read_procedure("EmptyProc.ipf")
+
+        com_call.assert_not_called()
+        self.assertTrue(first["ok"])
+        self.assertEqual(first["transport"], "pipe")
+        self.assertEqual(first["name"], "MyAnalysis.ipf")
+        self.assertEqual(first["total_lines"], 5)
+        self.assertEqual(first["start_line"], 0)
+        self.assertEqual(first["returned_lines"], 2)
+        self.assertTrue(first["truncated"])
+        self.assertEqual(first["content"], "line0\nline1")
+
+        self.assertEqual(second["start_line"], 2)
+        self.assertEqual(second["returned_lines"], 3)
+        self.assertFalse(second["truncated"])
+        self.assertEqual(second["content"], "line2\nline3\nline4")
+
+        self.assertEqual(empty["total_lines"], 0)
+        self.assertEqual(empty["returned_lines"], 0)
+        self.assertFalse(empty["truncated"])
+        self.assertEqual(empty["content"], "")
+
+        # Missing procedure raises IgorError on pipe
+        with patch.object(server, "_try_pipe_client", return_value=_ProcPipeClient()):
+            with self.assertRaisesRegex(server.IgorError, "not found"):
+                server.read_procedure("Missing.ipf")
+
+        # COM fallback + pagination + missing procedure
+        def fake_query(_app, _fmt, expr):
+            if expr == 'ProcedureText("", 0, "MyAnalysis.ipf")':
+                return proc_sources["MyAnalysis.ipf"]
+            if expr == 'ProcedureText("", 0, "Ghost.ipf")':
+                return ""
+            if expr == 'WinList("*", ";", "WIN:128")':
+                return "MyAnalysis.ipf;EmptyProc.ipf;"
+            self.fail(f"Unexpected COM query: {expr}")
+
+        with (
+            patch.object(server, "_try_pipe_client", return_value=None),
+            patch.object(
+                server, "_with_igor", side_effect=lambda fn, **kw: fn(object(), 10.0)
+            ),
+            patch.object(server, "_query", side_effect=fake_query),
+        ):
+            com_res = server.read_procedure("MyAnalysis.ipf", start_line=1, max_lines=2)
+            with self.assertRaisesRegex(server.IgorError, "not found"):
+                server.read_procedure("Ghost.ipf")
+
+        self.assertTrue(com_res["ok"])
+        self.assertEqual(com_res["transport"], "com")
+        self.assertEqual(com_res["total_lines"], 5)
+        self.assertEqual(com_res["returned_lines"], 2)
+        self.assertTrue(com_res["truncated"])
+        self.assertEqual(com_res["content"], "line1\nline2")
+
+        # IGOR_TRANSPORT=pipe fails closed without COM fallback
+        with (
+            patch.dict(os.environ, {"IGOR_TRANSPORT": "pipe"}),
+            patch.object(server, "_try_pipe_client", return_value=None),
+            patch.object(server, "_with_igor") as com_closed,
+        ):
+            with self.assertRaisesRegex(server.IgorError, "IGOR_TRANSPORT=pipe"):
+                server.read_procedure("MyAnalysis.ipf")
+        com_closed.assert_not_called()
+
+        # Input validation
+        for bad_name in ("", "   ", "bad\nname.ipf", "bad\rname.ipf", "bad\x00name"):
+            with self.assertRaises(server.IgorError):
+                server.read_procedure(bad_name)
+        for bad_start in (-1, True, "0"):
+            with self.assertRaises(server.IgorError):
+                server.read_procedure("MyAnalysis.ipf", start_line=bad_start)
+        for bad_max in (0, 1001, False, "10"):
+            with self.assertRaises(server.IgorError):
+                server.read_procedure("MyAnalysis.ipf", max_lines=bad_max)
+
+    def test_profile_workflow_pipe_com_and_incremental_merge(self):
+        proc_texts = {
+            "WMGraphHelper.ipf": "#pragma rtGlobals=3\nFunction WM_Internal()\nEnd\n",
+            "LabFit.ipf": (
+                "#pragma rtGlobals=3\n"
+                "Function FitDecay(wave w)\n"
+                "\tCurveFit/Q exp_XOffset w\n"
+                "End\n"
+            ),
+            "Procedure": (
+                "#pragma rtGlobals=3\n"
+                "Menu \"Lab\"\n"
+                "\t\"Run Batch\", /Q, RunBatch()\n"
+                "End\n"
+                "Function RunBatch()\n"
+                "\tPrint \"done\"\n"
+                "End\n"
+            ),
+        }
+        graph_recreation = (
+            "Window Graph0() : Graph\n"
+            "\tPauseUpdate; Silent 1\n"
+            "\tDisplay /W=(35,53,430,261) signal\n"
+            '\tModifyGraph font="Arial",fSize=12,mirror=1,tick=2\n'
+            "\tModifyGraph rgb(signal)=(0,0,65535),lsize=1.5\n"
+            '\tLabel left "Current (nA)"\n'
+            '\tLabel bottom "Time (ms)"\n'
+            "EndMacro\n"
+        )
+
+        def _make_pipe_client(exp_name: str, extra_proc: tuple[str, str] | None = None):
+            local_procs = dict(proc_texts)
+            if extra_proc is not None:
+                local_procs[extra_proc[0]] = extra_proc[1]
+
+            class _WorkflowPipeClient(_FakePipeClient):
+                def call_function(self, name, args=None, kwargs=None, timeout_seconds=30.0):
+                    self.calls.append(("call_function", name, args, kwargs, timeout_seconds))
+                    if name == "DataFolderExists":
+                        return {"type": "number", "value": 1 if args[0] == "root:" else 0}
+                    if name == "IgorInfo":
+                        if args == [1]:
+                            return {"type": "string", "value": exp_name}
+                        if args == [12]:
+                            return {"type": "string", "value": f"{exp_name}.pxp"}
+                    if name == "CountObjects":
+                        return {"type": "number", "value": 1 if args[1] == 1 else 0}
+                    if name == "GetIndexedObjName":
+                        return {"type": "string", "value": "signal"}
+                    if name == "WinList":
+                        if args[2] == "WIN:1":
+                            return {"type": "string", "value": "Graph0;"}
+                        if args[2] == "WIN:128":
+                            return {
+                                "type": "string",
+                                "value": ";".join(local_procs.keys()) + ";",
+                            }
+                        return {"type": "string", "value": ""}
+                    if name == "ProcedureText":
+                        return {"type": "string", "value": local_procs.get(args[2], "")}
+                    if name == "WinRecreation":
+                        return {"type": "string", "value": graph_recreation}
+                    return {"type": "string", "value": ""}
+
+                def execute_command(self, command, timeout_seconds=30.0):
+                    self.calls.append(("execute_command", command, timeout_seconds))
+                    if "PathInfo home" in command:
+                        return {"results": r"C:\Lab\Data", "history": ""}
+                    return {"results": "", "history": ""}
+
+            return _WorkflowPipeClient()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict(os.environ, {"IGOR_SESSION_DIR": tmpdir}):
+                # First experiment over pipe, with max_procedures=2 (prioritizes Procedure, LabFit.ipf over WMGraphHelper.ipf)
+                with (
+                    patch.object(
+                        server,
+                        "_try_pipe_client",
+                        return_value=_make_pipe_client("ExpOne"),
+                    ),
+                    patch.object(server, "_with_igor") as com_call,
+                ):
+                    res1 = server.profile_workflow(
+                        max_procedures=2,
+                        save_profile=True,
+                        profile_name="gabor-lab",
+                        user_notes="Prefer Arial 12pt and mirror axes.",
+                    )
+
+                com_call.assert_not_called()
+                self.assertTrue(res1["ok"])
+                self.assertEqual(res1["transport"], "pipe")
+                self.assertEqual(res1["experiment"]["name"], "ExpOne")
+                self.assertEqual(res1["folder_count"], 1)
+                self.assertEqual(res1["total_waves"], 1)
+                self.assertTrue(res1["procedures_truncated"])
+                self.assertEqual(
+                    [p["name"] for p in res1["procedures"]],
+                    ["Procedure", "LabFit.ipf"],
+                )
+                self.assertEqual(len(res1["graph_styles"]), 1)
+                self.assertIsInstance(res1["style_defaults"], dict)
+                self.assertIsNotNone(res1["saved_profile"])
+
+                # Second experiment incrementally merges into the same workflow profile
+                with patch.object(
+                    server,
+                    "_try_pipe_client",
+                    return_value=_make_pipe_client(
+                        "ExpTwo",
+                        extra_proc=(
+                            "ExtraAnalysis.ipf",
+                            "#pragma rtGlobals=3\nFunction ComputeSNR(wave w)\nEnd\n",
+                        ),
+                    ),
+                ):
+                    res2 = server.profile_workflow(
+                        max_procedures=10,
+                        include_window_styles=False,
+                        save_profile=True,
+                        profile_name="gabor-lab",
+                        user_notes="Store fits in root:Fits:",
+                    )
+
+                self.assertEqual(res2["graph_styles"], [])
+                self.assertIsNotNone(res2["saved_profile"])
+                self.assertTrue(res2["saved_profile"]["merged"])
+                self.assertEqual(res2["saved_profile"]["observations_count"], 2)
+                # Verify saved profile files exist and merged both experiments/notes
+                md_path = Path(res2["saved_profile"]["markdown_path"])
+                json_path = Path(res2["saved_profile"]["json_path"])
+                self.assertTrue(md_path.exists())
+                self.assertTrue(json_path.exists())
+                saved_text = md_path.read_text(encoding="utf-8")
+                self.assertIn("ExpOne", saved_text)
+                self.assertIn("ExpTwo", saved_text)
+                self.assertIn("Prefer Arial 12pt", saved_text)
+                self.assertIn("Store fits in root:Fits:", saved_text)
+
+        # COM fallback path (save_profile=False)
+        def fake_com_query(_app, _fmt, expr):
+            if expr == 'DataFolderExists("root:")':
+                return "1"
+            if expr == "IgorInfo(1)":
+                return "ComExp"
+            if expr == "IgorInfo(12)":
+                return ""
+            if 'CountObjects("root:", 1)' in expr:
+                return "1|0|0|0"
+            if expr == 'GetIndexedObjName("root:", 1, 0)':
+                return "signal"
+            if expr == 'WinList("*", ";", "WIN:1")':
+                return "Graph0;"
+            if expr == 'WinList("*", ";", "WIN:128")':
+                return "Procedure;LabFit.ipf;"
+            if expr.startswith('WinList("*", ";", "WIN:'):
+                return ""
+            if expr == 'ProcedureText("", 0, "Procedure")':
+                return proc_texts["Procedure"]
+            if expr == 'ProcedureText("", 0, "LabFit.ipf")':
+                return proc_texts["LabFit.ipf"]
+            if expr == 'WinRecreation("Graph0", 0)':
+                return graph_recreation
+            if expr == "IgorInfo(10)":
+                return "VDT2-64;"
+            self.fail(f"Unexpected COM query: {expr}")
+
+        with (
+            patch.object(server, "_try_pipe_client", return_value=None),
+            patch.object(
+                server, "_with_igor", side_effect=lambda fn, **kw: fn(object(), 10.0)
+            ),
+            patch.object(server, "_query", side_effect=fake_com_query),
+        ):
+            com_res = server.profile_workflow(save_profile=False)
+
+        self.assertTrue(com_res["ok"])
+        self.assertEqual(com_res["transport"], "com")
+        self.assertEqual(com_res["experiment"]["name"], "ComExp")
+        self.assertEqual(
+            [p["name"] for p in com_res["procedures"]],
+            ["Procedure", "LabFit.ipf"],
+        )
+        self.assertEqual(len(com_res["graph_styles"]), 1)
+        self.assertEqual(com_res["loaded_xops"], ["VDT2-64"])
+        self.assertIsNone(com_res["saved_profile"])
+
+        # IGOR_TRANSPORT=pipe fails closed without COM fallback
+        with (
+            patch.dict(os.environ, {"IGOR_TRANSPORT": "pipe"}),
+            patch.object(server, "_try_pipe_client", return_value=None),
+            patch.object(server, "_with_igor") as com_closed,
+        ):
+            with self.assertRaisesRegex(server.IgorError, "IGOR_TRANSPORT=pipe"):
+                server.profile_workflow()
+        com_closed.assert_not_called()
 
 
 if __name__ == "__main__":

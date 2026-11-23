@@ -57,7 +57,7 @@ except Exception as _e:  # pywin32 missing or broken; tools report it clearly.
     _PYWIN32_IMPORT_ERROR = str(_e)
 
 
-_SERVER_VERSION = "0.4.0"
+_SERVER_VERSION = "0.5.0"
 _PROGIDS = ("IgorPro.Application", "Igor.Application")
 _MIN_IGOR_VERSION = 6.0
 _WAVE_TYPE_SELECTOR_VERSION = 6.1
@@ -151,6 +151,12 @@ _INSPECT_MIN_FOLDERS = 1
 _INSPECT_MAX_FOLDERS = 200
 _INSPECT_MAX_WAVES_PER_FOLDER = 20
 _INSPECT_WINDOW_TYPES = ("graph", "table", "layout", "panel", "notebook", "gizmo")
+_READ_PROCEDURE_MIN_LINES = 1
+_READ_PROCEDURE_MAX_LINES = 1000
+_PROFILE_MIN_PROCEDURES = 0
+_PROFILE_MAX_PROCEDURES = 50
+_PROFILE_MIN_STYLE_GRAPHS = 0
+_PROFILE_MAX_STYLE_GRAPHS = 20
 _MIN_USER_TIMEOUT_SECONDS = 1.0
 _MAX_USER_TIMEOUT_SECONDS = 600.0
 _PIPE_WORKER_TIMEOUT_GRACE_SECONDS = 3.0
@@ -381,6 +387,10 @@ mcp = IgorFastMCP(
         "windows, capture_window to visually verify plots, compile_procedures "
         "for silent .ipf reload/compile, and abort_igor to cancel hung server "
         "commands. "
+        "When the user asks to understand their workflow or opens an experiment "
+        "with custom procedures or styled graphs, call profile_workflow (with "
+        "save_profile=True to build up and merge a reusable profile across "
+        "experiments) and use read_procedure to inspect specific functions. "
         "For complex procedure work, inspect data first, write one bounded "
         "procedure, load/compile it, and verify outputs without blindly retrying "
         "after an unknown result. "
@@ -620,6 +630,34 @@ class InspectExperimentResult(TypedDict):
     truncated: bool
     folders: list[InspectFolderSummary]
     windows: InspectWindowsSummary
+
+
+class ReadProcedureResult(TypedDict):
+    ok: bool
+    name: str
+    total_lines: int
+    start_line: int
+    returned_lines: int
+    truncated: bool
+    content: str
+    transport: Literal["pipe", "com"]
+
+
+class ProfileWorkflowResult(TypedDict):
+    ok: bool
+    transport: Literal["pipe", "com"]
+    experiment: InspectExperimentInfo
+    root_folder: str
+    folder_count: int
+    total_waves: int
+    folders: list[InspectFolderSummary]
+    windows: InspectWindowsSummary
+    loaded_xops: list[str]
+    procedures: list[dict[str, Any]]
+    procedures_truncated: bool
+    graph_styles: list[dict[str, Any]]
+    style_defaults: dict[str, Any]
+    saved_profile: dict[str, Any] | None
 
 
 class IgorError(Exception):
@@ -6364,6 +6402,520 @@ def inspect_experiment(
         ),
         auto_start=False,
     )
+
+
+def _validate_procedure_window_name(name: str) -> str:
+    """Validate a procedure window name for ProcedureText lookups."""
+    if not isinstance(name, str) or not name.strip():
+        raise IgorError("Procedure window name must be a non-empty string")
+    if "\x00" in name or "\r" in name or "\n" in name:
+        raise IgorError("Procedure window name cannot contain null bytes or newlines")
+    return name.strip()
+
+
+def _read_procedure_text_via_pipe(
+    client: igor_pipe.IgorPipeClient,
+    name: str,
+    *,
+    known_procedures: list[str] | None = None,
+) -> str:
+    """Read full procedure window text over the native JSON-RPC pipe."""
+    resp = client.call_function("ProcedureText", ["", 0, name], timeout_seconds=15.0)
+    text = str(resp.get("value", "") or "")
+    if not text:
+        if known_procedures is None:
+            win_resp = client.call_function(
+                "WinList", ["*", ";", "WIN:128"], timeout_seconds=10.0
+            )
+            raw_list = str(win_resp.get("value", "") or "")
+            known_procedures = [p.strip() for p in raw_list.split(";") if p.strip()]
+        if name not in known_procedures:
+            raise IgorError(f"Procedure window '{name}' not found")
+    return text
+
+
+def _read_procedure_text_via_com(
+    app,
+    name: str,
+    *,
+    known_procedures: list[str] | None = None,
+) -> str:
+    """Read full procedure window text over COM via temp-file _query."""
+    escaped = _igor_escape(name)
+    text = _query(app, "%s", f'ProcedureText("", 0, "{escaped}")')
+    if not text:
+        if known_procedures is None:
+            raw_list = _query(app, "%s", 'WinList("*", ";", "WIN:128")')
+            known_procedures = [p.strip() for p in raw_list.split(";") if p.strip()]
+        if name not in known_procedures:
+            raise IgorError(f"Procedure window '{name}' not found")
+    return text
+
+
+def _slice_procedure_result(
+    *,
+    name: str,
+    text: str,
+    start_line: int,
+    max_lines: int,
+    transport: Literal["pipe", "com"],
+) -> ReadProcedureResult:
+    """Normalize newlines and return a paginated ReadProcedureResult."""
+    lines = _normalize_newlines(text).splitlines()
+    total = len(lines)
+    window = lines[start_line : start_line + max_lines]
+    return {
+        "ok": True,
+        "name": name,
+        "total_lines": total,
+        "start_line": start_line,
+        "returned_lines": len(window),
+        "truncated": (start_line + len(window)) < total,
+        "content": "\n".join(window),
+        "transport": transport,
+    }
+
+
+@mcp.tool(annotations=_READ_ONLY_ANNOTATIONS, structured_output=True)
+def read_procedure(
+    name: Annotated[
+        str,
+        Field(
+            description=(
+                "Procedure window name as reported by list_procedures or profile_workflow "
+                "(e.g. 'Procedure' or 'MyAnalysis.ipf')."
+            )
+        ),
+    ],
+    start_line: Annotated[
+        int,
+        Field(
+            ge=0,
+            description="0-based starting line offset into the procedure text (default 0).",
+        ),
+    ] = 0,
+    max_lines: Annotated[
+        int,
+        Field(
+            ge=1,
+            le=1000,
+            description="Maximum number of lines to return (1 to 1000, default 200).",
+        ),
+    ] = 200,
+) -> ReadProcedureResult:
+    """Read paginated source lines from an open Igor procedure window.
+
+    Prefers the Igor Pro 10.04+ native JSON-RPC pipe with automatic COM
+    fallback (via temp-file capture so large procedures are not truncated).
+    """
+    proc_name = _validate_procedure_window_name(name)
+    if isinstance(start_line, bool) or not isinstance(start_line, int) or start_line < 0:
+        raise IgorError("start_line must be a non-negative integer")
+    if (
+        isinstance(max_lines, bool)
+        or not isinstance(max_lines, int)
+        or max_lines < _READ_PROCEDURE_MIN_LINES
+        or max_lines > _READ_PROCEDURE_MAX_LINES
+    ):
+        raise IgorError(
+            f"max_lines must be between {_READ_PROCEDURE_MIN_LINES} and {_READ_PROCEDURE_MAX_LINES}"
+        )
+
+    mode = _transport_mode()
+    if mode != "com":
+        try:
+            used_pipe, pipe_result = _run_with_pooled_pipe(
+                lambda client: _slice_procedure_result(
+                    name=proc_name,
+                    text=_read_procedure_text_via_pipe(client, proc_name),
+                    start_line=start_line,
+                    max_lines=max_lines,
+                    transport="pipe",
+                ),
+                timeout_seconds=2.0,
+            )
+            if used_pipe:
+                return pipe_result
+            if mode == "pipe":
+                raise IgorError(
+                    "No active Igor Pro named-pipe instance found (IGOR_TRANSPORT=pipe)."
+                )
+        except igor_pipe.PipeNotAvailableError as exc:
+            if mode == "pipe":
+                raise IgorError(str(exc)) from exc
+        except igor_pipe.IgorPipeError as exc:
+            raise IgorError(str(exc)) from exc
+
+    return _with_igor(
+        lambda app, _version: _slice_procedure_result(
+            name=proc_name,
+            text=_read_procedure_text_via_com(app, proc_name),
+            start_line=start_line,
+            max_lines=max_lines,
+            transport="com",
+        ),
+        auto_start=False,
+    )
+
+
+def _is_likely_builtin_procedure(name: str) -> bool:
+    """Return True for WaveMetrics/builtin procedure windows that should rank after user code."""
+    lower = name.strip().lower()
+    if lower == "procedure":
+        return False
+    if lower.startswith("<") and lower.endswith(">"):
+        return True
+    if lower.startswith("wm") or "wavemetrics" in lower:
+        return True
+    return False
+
+
+def _prioritize_procedure_windows(names: list[str]) -> list[str]:
+    """Order procedure windows: main 'Procedure' first, user .ipf files next, builtins last."""
+    primary: list[str] = []
+    user_procs: list[str] = []
+    builtin_procs: list[str] = []
+    for name in names:
+        cleaned = name.strip()
+        if not cleaned:
+            continue
+        if cleaned.lower() == "procedure":
+            primary.append(cleaned)
+        elif _is_likely_builtin_procedure(cleaned):
+            builtin_procs.append(cleaned)
+        else:
+            user_procs.append(cleaned)
+    return primary + user_procs + builtin_procs
+
+
+def _profile_workflow_via_pipe(
+    client: igor_pipe.IgorPipeClient,
+    *,
+    root_folder: str,
+    max_depth: int,
+    max_folders: int,
+    max_procedures: int,
+    max_style_graphs: int,
+    include_window_styles: bool,
+) -> ProfileWorkflowResult:
+    """Collect a read-only workflow profile over the native JSON-RPC pipe."""
+    import igor_workflows
+
+    snapshot = _inspect_experiment_via_pipe(
+        client,
+        root_folder=root_folder,
+        max_depth=max_depth,
+        max_folders=max_folders,
+        include_wave_names=True,
+    )
+
+    proc_resp = client.call_function(
+        "WinList", ["*", ";", "WIN:128"], timeout_seconds=10.0
+    )
+    all_procs = _prioritize_procedure_windows(
+        str(proc_resp.get("value", "") or "").split(";")
+    )
+    procedures_truncated = len(all_procs) > max_procedures
+    procedures: list[dict[str, Any]] = []
+    for proc_name in all_procs[:max_procedures]:
+        text = _read_procedure_text_via_pipe(
+            client, proc_name, known_procedures=all_procs
+        )
+        procedures.append(igor_workflows.parse_procedure_outline(proc_name, text))
+
+    graph_styles: list[dict[str, Any]] = []
+    if include_window_styles and max_style_graphs > 0:
+        for graph_name in snapshot["windows"]["graph"][:max_style_graphs]:
+            rec_resp = client.call_function(
+                "WinRecreation", [graph_name, 0], timeout_seconds=10.0
+            )
+            rec_text = str(rec_resp.get("value", "") or "")
+            graph_styles.append(igor_workflows.parse_graph_style(graph_name, rec_text))
+    style_defaults = igor_workflows.summarize_style_conventions(graph_styles)
+
+    loaded_xops: list[str] = []
+    try:
+        xop_resp = client.call_function("IgorInfo", [10], timeout_seconds=5.0)
+        loaded_xops = [
+            item.strip()
+            for item in str(xop_resp.get("value", "") or "").split(";")
+            if item.strip()
+        ]
+    except igor_pipe.IgorPipeError:
+        loaded_xops = []
+
+    return {
+        "ok": True,
+        "transport": "pipe",
+        "experiment": snapshot["experiment"],
+        "root_folder": snapshot["root_folder"],
+        "folder_count": snapshot["folder_count"],
+        "total_waves": snapshot["total_waves"],
+        "folders": snapshot["folders"],
+        "windows": snapshot["windows"],
+        "loaded_xops": loaded_xops,
+        "procedures": procedures,
+        "procedures_truncated": procedures_truncated,
+        "graph_styles": graph_styles,
+        "style_defaults": style_defaults,
+        "saved_profile": None,
+    }
+
+
+def _profile_workflow_via_com(
+    app,
+    *,
+    root_folder: str,
+    max_depth: int,
+    max_folders: int,
+    max_procedures: int,
+    max_style_graphs: int,
+    include_window_styles: bool,
+) -> ProfileWorkflowResult:
+    """Collect a read-only workflow profile over COM."""
+    import igor_workflows
+
+    snapshot = _inspect_experiment_via_com(
+        app,
+        root_folder=root_folder,
+        max_depth=max_depth,
+        max_folders=max_folders,
+        include_wave_names=True,
+    )
+
+    raw_procs = _query(app, "%s", 'WinList("*", ";", "WIN:128")')
+    all_procs = _prioritize_procedure_windows(raw_procs.split(";"))
+    procedures_truncated = len(all_procs) > max_procedures
+    procedures: list[dict[str, Any]] = []
+    for proc_name in all_procs[:max_procedures]:
+        text = _read_procedure_text_via_com(
+            app, proc_name, known_procedures=all_procs
+        )
+        procedures.append(igor_workflows.parse_procedure_outline(proc_name, text))
+
+    graph_styles: list[dict[str, Any]] = []
+    if include_window_styles and max_style_graphs > 0:
+        for graph_name in snapshot["windows"]["graph"][:max_style_graphs]:
+            escaped_graph = _igor_escape(graph_name)
+            rec_text = _query(app, "%s", f'WinRecreation("{escaped_graph}", 0)')
+            graph_styles.append(igor_workflows.parse_graph_style(graph_name, rec_text))
+    style_defaults = igor_workflows.summarize_style_conventions(graph_styles)
+
+    loaded_xops: list[str] = []
+    try:
+        raw_xops = _query(app, "%s", "IgorInfo(10)")
+        loaded_xops = [item.strip() for item in raw_xops.split(";") if item.strip()]
+    except IgorError:
+        loaded_xops = []
+
+    return {
+        "ok": True,
+        "transport": "com",
+        "experiment": snapshot["experiment"],
+        "root_folder": snapshot["root_folder"],
+        "folder_count": snapshot["folder_count"],
+        "total_waves": snapshot["total_waves"],
+        "folders": snapshot["folders"],
+        "windows": snapshot["windows"],
+        "loaded_xops": loaded_xops,
+        "procedures": procedures,
+        "procedures_truncated": procedures_truncated,
+        "graph_styles": graph_styles,
+        "style_defaults": style_defaults,
+        "saved_profile": None,
+    }
+
+
+@mcp.tool(annotations=_READ_ONLY_ANNOTATIONS, structured_output=True)
+def profile_workflow(
+    root_folder: Annotated[
+        str,
+        Field(
+            description=(
+                "Starting Igor data folder path (normalized with trailing ':', default 'root:')."
+            )
+        ),
+    ] = "root:",
+    max_depth: Annotated[
+        int,
+        Field(
+            ge=1,
+            le=10,
+            description="Maximum data-folder traversal depth (1 to 10, default 3).",
+        ),
+    ] = 3,
+    max_folders: Annotated[
+        int,
+        Field(
+            ge=1,
+            le=200,
+            description="Maximum number of data folders to inspect (1 to 200, default 40).",
+        ),
+    ] = 40,
+    max_procedures: Annotated[
+        int,
+        Field(
+            ge=0,
+            le=50,
+            description="Maximum number of open procedure windows to outline (0 to 50, default 12).",
+        ),
+    ] = 12,
+    max_style_graphs: Annotated[
+        int,
+        Field(
+            ge=0,
+            le=20,
+            description="Maximum number of open graph windows to parse for style conventions (0 to 20, default 5).",
+        ),
+    ] = 5,
+    include_window_styles: Annotated[
+        bool,
+        Field(
+            description=(
+                "When true (default), inspect graph recreation macros and summarize plotting style defaults."
+            )
+        ),
+    ] = True,
+    save_profile: Annotated[
+        bool,
+        Field(
+            description=(
+                "When true, persist and incrementally merge this snapshot into a local workflow profile in session memory."
+            )
+        ),
+    ] = False,
+    profile_name: Annotated[
+        str | None,
+        Field(
+            description=(
+                "Optional workflow profile name used when save_profile=True (e.g. 'gabor-lab'); defaults to the open experiment name."
+            )
+        ),
+    ] = None,
+    user_notes: Annotated[
+        str | None,
+        Field(
+            description=(
+                "Optional user preferences or lab conventions to record when save_profile=True."
+            )
+        ),
+    ] = None,
+) -> ProfileWorkflowResult:
+    """Profile the open Igor experiment's structure, procedures, and graph style conventions.
+
+    Never mutates Igor state or reads bulk wave arrays. Summarizes data folders,
+    procedure outlines (prioritizing main 'Procedure' and user .ipf files), and
+    graph recreation styles. Set save_profile=True to persist and incrementally
+    merge a reusable workflow profile in local session memory.
+    """
+    normalized_root = _normalize_inspect_root_folder(root_folder)
+    clamped_depth = _clamp_inspect_int(
+        max_depth,
+        label="max_depth",
+        minimum=_INSPECT_MIN_DEPTH,
+        maximum=_INSPECT_MAX_DEPTH,
+    )
+    clamped_folders = _clamp_inspect_int(
+        max_folders,
+        label="max_folders",
+        minimum=_INSPECT_MIN_FOLDERS,
+        maximum=_INSPECT_MAX_FOLDERS,
+    )
+    clamped_procedures = _clamp_inspect_int(
+        max_procedures,
+        label="max_procedures",
+        minimum=_PROFILE_MIN_PROCEDURES,
+        maximum=_PROFILE_MAX_PROCEDURES,
+    )
+    clamped_graphs = _clamp_inspect_int(
+        max_style_graphs,
+        label="max_style_graphs",
+        minimum=_PROFILE_MIN_STYLE_GRAPHS,
+        maximum=_PROFILE_MAX_STYLE_GRAPHS,
+    )
+    if not isinstance(include_window_styles, bool):
+        raise IgorError("include_window_styles must be true or false")
+    if not isinstance(save_profile, bool):
+        raise IgorError("save_profile must be true or false")
+    if profile_name is not None:
+        if not isinstance(profile_name, str):
+            raise IgorError("profile_name must be a string or null")
+        if "\x00" in profile_name or "\r" in profile_name or "\n" in profile_name:
+            raise IgorError("profile_name cannot contain null bytes or newlines")
+    if user_notes is not None:
+        if not isinstance(user_notes, str):
+            raise IgorError("user_notes must be a string or null")
+        if "\x00" in user_notes:
+            raise IgorError("user_notes cannot contain null bytes")
+
+    mode = _transport_mode()
+    result: ProfileWorkflowResult | None = None
+    if mode != "com":
+        try:
+            used_pipe, pipe_result = _run_with_pooled_pipe(
+                lambda client: _profile_workflow_via_pipe(
+                    client,
+                    root_folder=normalized_root,
+                    max_depth=clamped_depth,
+                    max_folders=clamped_folders,
+                    max_procedures=clamped_procedures,
+                    max_style_graphs=clamped_graphs,
+                    include_window_styles=include_window_styles,
+                ),
+                timeout_seconds=2.0,
+            )
+            if used_pipe:
+                result = pipe_result
+            elif mode == "pipe":
+                raise IgorError(
+                    "No active Igor Pro named-pipe instance found (IGOR_TRANSPORT=pipe)."
+                )
+        except igor_pipe.PipeNotAvailableError as exc:
+            if mode == "pipe":
+                raise IgorError(str(exc)) from exc
+        except igor_pipe.IgorPipeError as exc:
+            raise IgorError(str(exc)) from exc
+
+    if result is None:
+        result = _with_igor(
+            lambda app, _version: _profile_workflow_via_com(
+                app,
+                root_folder=normalized_root,
+                max_depth=clamped_depth,
+                max_folders=clamped_folders,
+                max_procedures=clamped_procedures,
+                max_style_graphs=clamped_graphs,
+                include_window_styles=include_window_styles,
+            ),
+            auto_start=False,
+        )
+
+    if save_profile:
+        import igor_workflows
+
+        effective_name = (
+            profile_name.strip()
+            if isinstance(profile_name, str) and profile_name.strip()
+            else result["experiment"]["name"] or "default"
+        )
+        profile_snapshot = {
+            "experiment_name": (
+                result["experiment"]["file_name"]
+                or result["experiment"]["name"]
+            ),
+            "folder_patterns": [folder["path"] for folder in result["folders"]],
+            "loaded_xops": result["loaded_xops"],
+            "procedures": result["procedures"],
+            "graph_styles": result["graph_styles"],
+            "style_defaults": result["style_defaults"],
+        }
+        result["saved_profile"] = igor_workflows.save_or_merge_workflow_profile(
+            effective_name,
+            profile_snapshot,
+            user_notes=user_notes,
+        )
+
+    return result
 
 
 def main() -> None:

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "igor-pro-mcp"
-version = "0.4.0"
+version = "0.5.0"
 description = "Windows Igor Pro MCP server with native JSON-RPC pipe transport, COM fallback, and bundled Markdown knowledge"
 readme = "README.md"
 license = "MIT"
@@ -35,7 +35,7 @@ igor-pro-mcp = "igor_mcp_server:main"
 igor-mcp-server = "igor_mcp_server:main"
 
 [tool.setuptools]
-py-modules = ["igor_mcp_server", "igor_pipe", "igor_knowledge", "igor_sessions", "igor_reports", "igor_report_links"]
+py-modules = ["igor_mcp_server", "igor_pipe", "igor_knowledge", "igor_sessions", "igor_reports", "igor_report_links", "igor_workflows"]
 packages = ["knowledge", "native"]
 
 [tool.setuptools.package-data]
