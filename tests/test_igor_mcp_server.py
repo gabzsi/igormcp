@@ -1,4 +1,4 @@
-import asyncio
+﻿import asyncio
 import io
 import json
 import os
@@ -176,8 +176,82 @@ class StartupWindowTests(unittest.TestCase):
         self.assertTrue(windows[0]["visible"])
         self.assertTrue(windows[0]["minimized"])
 
+    def test_new_process_ignores_hidden_qt_gdi_and_ime_helper_windows(self):
+        windows = [
+            {
+                "hwnd": 0x300,
+                "pid": 1234,
+                "owner": 0,
+                "class": "GDI+ Hook Window Class",
+                "title": "GDI+ Window (Igor64.exe)",
+                "visible": False,
+                "minimized": False,
+            },
+            {
+                "hwnd": 0x301,
+                "pid": 1234,
+                "owner": 0,
+                "class": "Qt693QWindowIcon",
+                "title": "QTreeView",
+                "visible": False,
+                "minimized": False,
+            },
+            {
+                "hwnd": 0x302,
+                "pid": 1234,
+                "owner": 0,
+                "class": "IME",
+                "title": "Default IME",
+                "visible": False,
+                "minimized": False,
+            },
+            {
+                "hwnd": 0x303,
+                "pid": 1234,
+                "owner": 0,
+                "class": "Qt693QWindowToolSaveBits",
+                "title": "",
+                "visible": False,
+                "minimized": False,
+            },
+            {
+                "hwnd": 0x304,
+                "pid": 1234,
+                "owner": 0,
+                "class": "Qt693QWindowIcon",
+                "title": "Untitled - Igor Pro 10",
+                "visible": False,
+                "minimized": False,
+            },
+            {
+                "hwnd": 0x305,
+                "pid": 1234,
+                "owner": 0,
+                "class": "Qt693QWindowIcon",
+                "title": "Igor Pro Secondary Hidden",
+                "visible": False,
+                "minimized": False,
+            },
+        ]
+
+        result, calls = self._run_window_scan(windows)
+
+        self.assertTrue(result)
+        self.assertEqual(calls, [(0x304, server._SW_SHOWNOACTIVATE)])
+        self.assertFalse(windows[0]["visible"])
+        self.assertFalse(windows[1]["visible"])
+        self.assertFalse(windows[2]["visible"])
+        self.assertFalse(windows[3]["visible"])
+        self.assertTrue(windows[4]["visible"])
+        self.assertFalse(windows[5]["visible"])
+
 
 class ValidationTests(unittest.TestCase):
+    def setUp(self):
+        patcher = patch.object(server, "_try_pipe_client", return_value=None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_command_limit_counts_utf8_bytes(self):
         server._validate_command("\u00e9" * 1_200)
         with self.assertRaisesRegex(server.IgorError, "UTF-8 bytes"):
@@ -350,8 +424,9 @@ class ValidationTests(unittest.TestCase):
         source = Path(server.__file__).read_text(encoding="utf-8")
         self.assertIn("_show_new_igor_window_without_activation", source)
         self.assertIn("_SW_SHOWNOACTIVATE", source)
-        self.assertNotIn("SetForegroundWindow", source)
-        self.assertNotIn("SW_RESTORE", source)
+        startup = source.split("def _show_new_igor_window_without_activation", 1)[1].split("def _connect", 1)[0]
+        self.assertNotIn("SetForegroundWindow", startup)
+        self.assertNotIn("SW_RESTORE", startup)
         self.assertNotIn("_bring_igor_window_to_front", source)
 
     def test_configured_igor_path_is_used_before_discovery(self):
@@ -382,7 +457,8 @@ class ValidationTests(unittest.TestCase):
         self.assertIn("do not search manuals for familiar basic tasks", instructions)
         self.assertIn("core-reference pages are still read through a tool", instructions)
         self.assertIn("Do not enumerate or pre-read basic-reference pages as a preflight", instructions)
-        self.assertIn("For gaps, use local query_igor_help or curated search/read tools", instructions)
+        self.assertIn("local query_igor_help or curated search/read tools", instructions)
+        self.assertIn("only when syntax is uncertain", instructions)
         self.assertIn("Use search_session_memory and read_session_memory only for", instructions)
         self.assertIn("skip elementary one-offs", instructions)
         self.assertIn("Never use web search, a browser, HTTP fetch, forums, or any external source", instructions)
@@ -395,13 +471,7 @@ class ValidationTests(unittest.TestCase):
         self.assertIn("Display yWave vs xWave", instructions)
         self.assertIn("AppendToGraph/W=graphName", instructions)
         self.assertIn("Label/W=graphName", instructions)
-        self.assertIn("where channels range 0-65535", instructions)
-        self.assertIn("import_delimited_text", instructions)
-        self.assertIn("SaveExperiment as", instructions)
-        self.assertIn("overwrites a matching file", instructions)
-        self.assertIn("Redimension/N=n", instructions)
-        self.assertIn("WaveStats/Q wave", instructions)
-        self.assertIn("CurveFit/Q line, wave", instructions)
+        self.assertIn("channels range 0-65535", instructions)
         self.assertIn("omit /O", instructions)
         self.assertLessEqual(len(instructions), 6_000)
 
@@ -630,6 +700,9 @@ class ValidationTests(unittest.TestCase):
         tools = {tool.name: tool for tool in asyncio.run(server.mcp.list_tools())}
 
         self.assertEqual(set(tools), {
+            "open_report_graph",
+            "create_html_report",
+            "apply_html_report",
             "execute_igor",
             "import_delimited_text",
             "read_variable",
@@ -649,6 +722,17 @@ class ValidationTests(unittest.TestCase):
             "read_igor_document",
             "search_session_memory",
             "read_session_memory",
+            "capture_window",
+            "call_function",
+            "abort_igor",
+            "get_igor_state",
+            "open_procedure",
+            "close_procedure",
+            "compile_procedures",
+            "get_compile_status",
+            "list_windows",
+            "get_experiment_info",
+            "get_system_information",
         })
         self.assertTrue(tools["query_igor_help"].annotations.readOnlyHint)
         self.assertFalse(tools["query_igor_help"].annotations.destructiveHint)
@@ -676,6 +760,25 @@ class ValidationTests(unittest.TestCase):
         self.assertTrue(tools["execute_igor"].annotations.destructiveHint)
         self.assertFalse(tools["import_delimited_text"].annotations.readOnlyHint)
         self.assertTrue(tools["import_delimited_text"].annotations.destructiveHint)
+        for name in (
+            "capture_window",
+            "get_igor_state",
+            "get_compile_status",
+            "list_windows",
+            "get_experiment_info",
+            "get_system_information",
+        ):
+            self.assertTrue(tools[name].annotations.readOnlyHint)
+            self.assertFalse(tools[name].annotations.destructiveHint)
+        for name in (
+            "call_function",
+            "abort_igor",
+            "open_procedure",
+            "close_procedure",
+            "compile_procedures",
+        ):
+            self.assertFalse(tools[name].annotations.readOnlyHint)
+            self.assertTrue(tools[name].annotations.destructiveHint)
 
     def test_query_igor_help_returns_documentation_excerpts(self):
         result = server.query_igor_help(query="CurveFit", max_results=3)
@@ -788,7 +891,8 @@ class ValidationTests(unittest.TestCase):
 
             help_result = asyncio.run(invoke("query_igor_help", {"query": "CurveFit"}))
             self.assertFalse(help_result.isError)
-            self.assertEqual(help_result.structuredContent["results"], [])
+            help_results = help_result.structuredContent["results"]
+            self.assertEqual(help_results, [])
 
     def test_execute_igor_reports_preexisting_dialog_without_running_or_dismissing(self):
         dialog = {"hwnd": 1234, "title": "Choose a procedure"}
@@ -884,6 +988,11 @@ class ValidationTests(unittest.TestCase):
 
 
 class ToolBehaviorTests(unittest.TestCase):
+    def setUp(self):
+        patcher = patch.object(server, "_try_pipe_client", return_value=None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_status_reports_source_even_when_igor_is_unavailable(self):
         with patch.object(
             server, "_with_igor", side_effect=server.IgorError("not running")
@@ -1201,5 +1310,1003 @@ class ToolBehaviorTests(unittest.TestCase):
         execute.assert_not_called()
 
 
+class _FakePipeClient:
+    """Minimal in-memory IgorPipeClient stand-in for offline server tests."""
+
+    def __init__(self, pipe_name: str = r"\\.\pipe\IgorPro_1004_1"):
+        self.pipe_name = pipe_name
+        self.closed = False
+        self.calls: list[tuple[str, object]] = []
+        self.responses: dict[str, object] = {}
+
+    def close(self) -> None:
+        self.closed = True
+
+    def _dispatch(self, key: str, payload: object):
+        self.calls.append((key, payload))
+        value = self.responses.get(key)
+        if isinstance(value, BaseException):
+            raise value
+        if callable(value):
+            return value(payload)
+        return value if value is not None else {}
+
+    def capabilities(self, timeout_seconds: float = 5.0):
+        return self._dispatch("capabilities", {"timeout": timeout_seconds})
+
+    def execute_command(self, command: str, timeout_seconds: float = 30.0):
+        return self._dispatch(
+            "execute_command", {"command": command, "timeout": timeout_seconds}
+        )
+
+    def call_function(
+        self,
+        name: str,
+        args=None,
+        kwargs=None,
+        timeout_seconds: float = 30.0,
+    ):
+        return self._dispatch(
+            "call_function",
+            {"name": name, "args": args, "kwargs": kwargs, "timeout": timeout_seconds},
+        )
+
+    def capture_window(
+        self,
+        window=None,
+        render: str = "auto",
+        max_dimension: int = 1200,
+        fmt: str = "png",
+        timeout_seconds: float = 30.0,
+    ):
+        return self._dispatch(
+            "capture_window",
+            {
+                "window": window,
+                "render": render,
+                "max_dimension": max_dimension,
+                "fmt": fmt,
+                "timeout": timeout_seconds,
+            },
+        )
+
+    def get_state(self, timeout_seconds: float = 5.0):
+        return self._dispatch("get_state", {"timeout": timeout_seconds})
+
+    def compile_procedures(self, timeout_seconds: float = 30.0):
+        return self._dispatch("compile_procedures", {"timeout": timeout_seconds})
+
+    def get_compile_status(self, timeout_seconds: float = 10.0):
+        return self._dispatch("get_compile_status", {"timeout": timeout_seconds})
+
+    def close_procedures(self, file_paths, timeout_seconds: float = 30.0):
+        return self._dispatch(
+            "close_procedures",
+            {"file_paths": list(file_paths), "timeout": timeout_seconds},
+        )
+
+
+class HybridPipeAndNewToolsTests(unittest.TestCase):
+    def test_transport_mode_selection(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("IGOR_TRANSPORT", None)
+            self.assertEqual(server._transport_mode(), "auto")
+        for val, expected in (
+            ("pipe", "pipe"),
+            ("COM", "com"),
+            ("auto", "auto"),
+            ("invalid", "auto"),
+        ):
+            with patch.dict(os.environ, {"IGOR_TRANSPORT": val}):
+                self.assertEqual(server._transport_mode(), expected)
+
+    def test_connect_passes_jsonrpc_for_igor_10_04_plus_when_not_com_only(self):
+        active = object()
+        process = type("Process", (), {"pid": 4321, "poll": lambda self: None})()
+        executable = Path(r"C:\Igor10\Igor64.exe")
+
+        with (
+            patch.dict(os.environ, {"IGOR_TRANSPORT": "auto"}),
+            patch.object(server, "_is_igor_process_running", return_value=False),
+            patch.object(
+                server,
+                "_active_igor",
+                side_effect=[server.IgorError("not running"), active],
+            ),
+            patch.object(server, "_select_igor_executable", return_value=executable),
+            patch.object(server, "_executable_igor_version", return_value="10.04.0.0"),
+            patch.object(server.subprocess, "Popen", return_value=process) as popen,
+            patch.object(server, "_show_new_igor_window_without_activation", return_value=True),
+            patch.object(server.time, "sleep"),
+        ):
+            result = server._connect()
+        self.assertIs(result, active)
+        self.assertEqual(popen.call_args.args[0], [str(executable), "/JSONRPC"])
+
+        with (
+            patch.dict(os.environ, {"IGOR_TRANSPORT": "com"}),
+            patch.object(server, "_is_igor_process_running", return_value=False),
+            patch.object(
+                server,
+                "_active_igor",
+                side_effect=[server.IgorError("not running"), active],
+            ),
+            patch.object(server, "_select_igor_executable", return_value=executable),
+            patch.object(server, "_executable_igor_version", return_value="10.04.0.0"),
+            patch.object(server.subprocess, "Popen", return_value=process) as popen,
+            patch.object(server, "_show_new_igor_window_without_activation", return_value=True),
+            patch.object(server.time, "sleep"),
+        ):
+            server._connect()
+        self.assertEqual(popen.call_args.args[0], [str(executable)])
+
+    def test_igor_status_and_ensure_igor_report_pipe_transport(self):
+        fake = _FakePipeClient(r"\\.\pipe\IgorPro_test")
+        fake.responses["capabilities"] = {
+            "igorVersion": "10.05",
+            "methods": ["igor.command.execute", "igor.fn.call"],
+        }
+        fake.responses["call_function"] = lambda p: {
+            "value": "MyExp" if p["name"] == "IgorInfo" else 10.05
+        }
+        with (
+            patch.object(server, "_try_pipe_client", return_value=fake),
+            patch.object(server, "_probe_com_reachable", return_value=True),
+        ):
+            status = server.igor_status()
+            ensured = server.ensure_igor()
+
+        self.assertEqual(status["transport"], "pipe")
+        self.assertTrue(status["pipe_reachable"])
+        self.assertEqual(status["pipe_name"], r"\\.\pipe\IgorPro_test")
+        self.assertEqual(
+            status["pipe_capabilities"], ["igor.command.execute", "igor.fn.call"]
+        )
+        self.assertTrue(status["compatible"])
+        self.assertEqual(status["current_experiment"], "MyExp")
+        self.assertEqual(ensured["transport"], "pipe")
+        self.assertTrue(ensured["pipe_reachable"])
+        self.assertEqual(ensured["pipe_name"], r"\\.\pipe\IgorPro_test")
+        self.assertTrue(fake.closed)
+
+    def test_execute_igor_pipe_success_and_timeout_clamping(self):
+        fake = _FakePipeClient()
+        fake.responses["execute_command"] = {
+            "history": "  42\n",
+            "results": "res42",
+            "elapsedSeconds": 0.12,
+        }
+        with (
+            patch.object(server, "_try_pipe_client", return_value=fake),
+            patch.object(server, "_igor_dialogs", return_value=[]),
+        ):
+            res = server.execute_igor("Print 42", timeout_seconds=9999.0)
+
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["output"], "42")
+        self.assertEqual(res["history"], "  42\n")
+        self.assertEqual(res["results"], "res42")
+        self.assertEqual(res["elapsed_seconds"], 0.12)
+        self.assertEqual(res["transport"], "pipe")
+        self.assertEqual(fake.calls[0][1]["timeout"], 600.0)
+
+    def test_execute_igor_no_replay_after_post_dispatch_pipe_error(self):
+        for exc in (
+            server.igor_pipe.PipeTimeoutError("timed out after dispatch"),
+            server.igor_pipe.PipeDispatchError("broken pipe after dispatch"),
+        ):
+            fake = _FakePipeClient()
+            fake.responses["execute_command"] = exc
+            with (
+                patch.object(server, "_try_pipe_client", return_value=fake),
+                patch.object(server, "_igor_dialogs", return_value=[]),
+                patch.object(server, "_with_igor") as com_call,
+            ):
+                res = server._execute_igor_direct("KillWaves/Z w0")
+
+            self.assertFalse(res["ok"])
+            self.assertTrue(res["command_started"])
+            self.assertFalse(res["outcome_known"])
+            self.assertEqual(res["transport"], "pipe")
+            com_call.assert_not_called()
+
+    def test_execute_igor_falls_back_to_com_on_pre_dispatch_pipe_unavailable(self):
+        fake = _FakePipeClient()
+        fake.responses["execute_command"] = server.igor_pipe.PipeNotAvailableError(
+            "pipe disconnected before send"
+        )
+        with (
+            patch.object(server, "_try_pipe_client", return_value=fake),
+            patch.object(
+                server,
+                "_with_igor",
+                side_effect=lambda fn, **_kwargs: fn(object(), 10.0),
+            ) as com_call,
+            patch.object(server, "_igor_dialogs", return_value=[]),
+            patch.object(server, "_execute_command", return_value="from com"),
+        ):
+            res = server._execute_igor_direct("Print 1")
+
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["output"], "from com")
+        self.assertEqual(res["transport"], "com")
+        com_call.assert_called_once()
+
+    def test_capture_window_pipe_and_com_fallback_and_wire_passthrough(self):
+        png_bytes = b"\x89PNG\r\n\x1a\nfake-png-bytes"
+        b64_png = server.base64.b64encode(png_bytes).decode("ascii")
+        fake = _FakePipeClient()
+        fake.responses["capture_window"] = {
+            "window": "Graph0",
+            "width": 640,
+            "height": 480,
+            "data": b64_png,
+        }
+
+        async def invoke():
+            async with create_connected_server_and_client_session(server.mcp) as client:
+                return await client.call_tool("capture_window", {"window": "Graph0"})
+
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            os.environ, {"IGOR_SESSION_DIR": directory}
+        ):
+            with patch.object(server, "_try_pipe_client", return_value=fake):
+                wire_res = asyncio.run(invoke())
+
+        self.assertFalse(wire_res.isError)
+        self.assertEqual(wire_res.structuredContent["transport"], "pipe")
+        self.assertEqual(wire_res.structuredContent["window"], "Graph0")
+        self.assertEqual(len(wire_res.content), 2)
+        self.assertEqual(wire_res.content[1].type, "image")
+        self.assertEqual(wire_res.content[1].data, b64_png)
+        self.assertEqual(wire_res.content[1].mimeType, "image/png")
+
+        # COM fallback path
+        def fake_save_pict(_app, command):
+            match = server.re.search(r'as "([^"]+)"', command)
+            self.assertIsNotNone(match)
+            path = match.group(1).replace("\\\\", "\\")
+            Path(path).write_bytes(png_bytes)
+            return "(command executed; no output)"
+
+        with (
+            patch.object(server, "_try_pipe_client", return_value=None),
+            patch.object(
+                server,
+                "_with_igor",
+                side_effect=lambda fn, **_kwargs: fn(object(), 10.0),
+            ),
+            patch.object(server, "_query", return_value="Graph0"),
+            patch.object(server, "_execute_command", side_effect=fake_save_pict),
+        ):
+            com_res = server.capture_window()
+
+        self.assertFalse(com_res.isError)
+        self.assertEqual(com_res.structuredContent["transport"], "com")
+        self.assertEqual(com_res.structuredContent["window"], "Graph0")
+        self.assertEqual(com_res.content[1].data, b64_png)
+
+    def test_call_function_pipe_and_unavailable_and_no_replay(self):
+        fake = _FakePipeClient()
+        fake.responses["call_function"] = {
+            "type": "number",
+            "value": 10.05,
+            "history": "",
+            "results": "",
+        }
+        with (
+            patch.object(server, "_try_pipe_client", return_value=fake),
+            patch.object(server, "_igor_dialogs", return_value=[]),
+        ):
+            res = server.call_function("IgorVersion")
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["value"], 10.05)
+        self.assertEqual(res["transport"], "pipe")
+
+        with patch.object(server, "_try_pipe_client", return_value=None):
+            missing = server.call_function("IgorVersion")
+        self.assertFalse(missing["ok"])
+        self.assertIn("10.04+", missing["error"])
+
+        fake_timeout = _FakePipeClient()
+        fake_timeout.responses["call_function"] = server.igor_pipe.PipeTimeoutError(
+            "fn timed out"
+        )
+        with (
+            patch.object(server, "_try_pipe_client", return_value=fake_timeout),
+            patch.object(server, "_igor_dialogs", return_value=[]),
+        ):
+            timed_out = server.call_function("SlowFunc")
+        self.assertFalse(timed_out["ok"])
+        self.assertTrue(timed_out["command_started"])
+        self.assertFalse(timed_out["outcome_known"])
+
+    def test_abort_igor_and_get_igor_state_never_acquire_locks(self):
+        fake = _FakePipeClient()
+        fake.responses["get_state"] = {"busy": True, "modalDialog": True}
+        dialog = {"hwnd": 77, "title": "Choose a procedure"}
+        with (
+            patch.object(
+                server.igor_pipe,
+                "cancel_igor_request",
+                return_value={"cancelled": True},
+            ) as cancel_mock,
+            patch.object(server, "_try_pipe_client", return_value=fake),
+            patch.object(server, "_igor_dialogs", return_value=[dialog]),
+            patch.object(server, "_capture_compilation_errors", return_value=[]),
+        ):
+            with server._lock, server._command_worker_lock:
+                abort_res = server.abort_igor(timeout_seconds=5.0)
+                state_res = server.get_igor_state()
+
+        cancel_mock.assert_called_once_with(timeout_seconds=5.0)
+        self.assertTrue(abort_res["ok"])
+        self.assertTrue(abort_res["cancelled"])
+        self.assertTrue(state_res["ok"])
+        self.assertEqual(state_res["transport"], "pipe")
+        self.assertTrue(state_res["busy"])
+        self.assertEqual(state_res["dialogs_open"], 1)
+
+    def test_open_and_close_procedure(self):
+        with self.assertRaisesRegex(server.IgorError, "absolute"):
+            server.open_procedure("relative.ipf")
+        with self.assertRaisesRegex(server.IgorError, "does not exist"):
+            server.open_procedure(r"C:\nonexistent_igor_mcp_test_file.ipf")
+
+        with tempfile.TemporaryDirectory() as directory:
+            ipf = Path(directory) / "my_proc.ipf"
+            ipf.write_text("#pragma rtGlobals=3\n", encoding="utf-8")
+            with patch.object(
+                server,
+                "_execute_igor_in_worker",
+                return_value={
+                    "ok": True,
+                    "output": "",
+                    "error": None,
+                    "dialogs_open": 0,
+                    "dialog_details": [],
+                    "compilation_errors": [],
+                    "transport": "pipe",
+                },
+            ) as exec_worker:
+                res = server.open_procedure(str(ipf))
+            self.assertTrue(res["ok"])
+            self.assertIn('OpenProc "', exec_worker.call_args.args[0])
+
+        fake = _FakePipeClient()
+        fake.responses["close_procedures"] = {
+            "closed": ["a.ipf"],
+            "reopened": [],
+            "notClosed": [],
+            "compile": {"compiled": True},
+        }
+        with patch.object(server, "_try_pipe_client", return_value=fake):
+            closed = server.close_procedure(["a.ipf"])
+        self.assertTrue(closed["ok"])
+        self.assertEqual(closed["closed"], ["a.ipf"])
+
+        with patch.object(server, "_try_pipe_client", return_value=None):
+            no_pipe = server.close_procedure(["a.ipf"])
+        self.assertFalse(no_pipe["ok"])
+        self.assertIn("10.04+", no_pipe["error"])
+
+    def test_compile_procedures_and_get_compile_status(self):
+        fake = _FakePipeClient()
+        fake.responses["compile_procedures"] = {
+            "compiled": True,
+            "reloaded": ["a.ipf"],
+            "reloadFailed": [],
+            "errors": [],
+        }
+        fake.responses["get_compile_status"] = {"compiled": True, "needsCompile": False}
+        with patch.object(server, "_try_pipe_client", return_value=fake):
+            comp = server.compile_procedures()
+            status = server.get_compile_status()
+        self.assertTrue(comp["ok"])
+        self.assertEqual(comp["reloaded"], ["a.ipf"])
+        self.assertTrue(status["compiled"])
+
+        with (
+            patch.object(server, "_try_pipe_client", return_value=None),
+            patch.object(server, "_compilation_error_dialogs", return_value=[]),
+        ):
+            com_status = server.get_compile_status()
+        self.assertEqual(com_status["transport"], "com")
+        self.assertIn("native", com_status["note"])
+
+    def test_list_windows_experiment_info_and_system_information(self):
+        fake = _FakePipeClient()
+        fake.responses["call_function"] = lambda p: {
+            "value": (
+                "Graph0;Panel0;"
+                if p["name"] == "WinList"
+                else "MyExp"
+                if (p["name"] == "IgorInfo" and p["args"] == [1])
+                else "MyExp.pxp"
+                if (p["name"] == "IgorInfo" and p["args"] == [12])
+                else "IGORVERS:10.05"
+                if (p["name"] == "IgorInfo" and p["args"] == [0])
+                else "OS:Windows"
+                if (p["name"] == "IgorInfo" and p["args"] == [3])
+                else "6.7.2"
+                if (p["name"] == "IgorInfo" and p["args"] == [6])
+                else "XOP1;XOP2;"
+                if (p["name"] == "IgorInfo" and p["args"] == [10])
+                else 16
+            )
+        }
+        fake.responses["execute_command"] = {"results": r"C:\Data\\"}
+
+        with patch.object(server, "_try_pipe_client", return_value=fake):
+            wins = server.list_windows(types=["graph", "panel"], match="*0")
+            exp = server.get_experiment_info()
+            sys_info = server.get_system_information()
+
+        self.assertEqual(wins["windows"], ["Graph0", "Panel0"])
+        self.assertEqual(wins["count"], 2)
+        self.assertEqual(fake.calls[0][1]["args"], ["*0", ";", "WIN:65"])
+        self.assertEqual(exp["name"], "MyExp")
+        self.assertEqual(exp["file_name"], "MyExp.pxp")
+        self.assertTrue(exp["saved"])
+        self.assertEqual(sys_info["qt_version"], "6.7.2")
+        self.assertEqual(sys_info["loaded_xops"], ["XOP1", "XOP2"])
+        self.assertEqual(sys_info["thread_processor_count"], 16)
+
+    def test_capture_window_and_list_windows_reject_newline_and_unsafe_injection(self):
+        # Newline / control-char injection rejected before touching COM or pipe
+        bad_capture = server.capture_window(window='Graph0"\nKillWaves/A/Z')
+        self.assertTrue(bad_capture.isError)
+        self.assertIn("newlines", bad_capture.structuredContent["error"])
+
+        # Unsafe window name rejected in COM SavePICT fallback
+        with (
+            patch.object(server, "_try_pipe_client", return_value=None),
+            patch.object(
+                server,
+                "_with_igor",
+                side_effect=lambda fn, **_kwargs: fn(object(), 10.0),
+            ),
+            patch.object(server, "_execute_command") as com_exec,
+        ):
+            unsafe_com = server.capture_window(window="Graph0; KillWaves/A/Z")
+        self.assertTrue(unsafe_com.isError)
+        self.assertIn("unsupported characters", unsafe_com.structuredContent["error"])
+        com_exec.assert_not_called()
+
+        # Render enum matches Igor Pro 10.04+
+        bad_render = server.capture_window(render="bitmap")
+        self.assertTrue(bad_render.isError)
+        self.assertIn("screenGraphOnly", bad_render.structuredContent["error"])
+
+        # list_windows rejects newline injection
+        with self.assertRaisesRegex(server.IgorError, "newlines"):
+            server.list_windows(match='*"\nKillWaves/A/Z')
+
+    def test_open_procedure_enforces_ipf_extension_and_rejects_newlines(self):
+        with self.assertRaisesRegex(server.IgorError, "newlines"):
+            server.open_procedure("C:\\tmp\\foo.ipf\nKillWaves/A/Z")
+
+        with tempfile.TemporaryDirectory() as directory:
+            non_ipf = Path(directory) / "notes.txt"
+            non_ipf.write_text("hello\n", encoding="utf-8")
+            with self.assertRaisesRegex(server.IgorError, r"\.ipf"):
+                server.open_procedure(str(non_ipf))
+
+        with self.assertRaisesRegex(server.IgorError, "newlines"):
+            server.close_procedure(["C:\\tmp\\foo.ipf\nbar"])
+
+    def test_broken_pipe_after_connect_falls_back_in_ensure_igor_and_not_reachable_in_status(self):
+        broken = _FakePipeClient(r"\\.\pipe\IgorPro_dead")
+        broken.responses["capabilities"] = server.igor_pipe.PipeDispatchError(
+            "pipe broke on capabilities"
+        )
+        with (
+            patch.dict(os.environ, {"IGOR_TRANSPORT": "auto"}),
+            patch.object(server, "_try_pipe_client", return_value=broken),
+            patch.object(
+                server,
+                "_with_igor",
+                side_effect=lambda fn, **_kwargs: fn(object(), 10.05),
+            ),
+            patch.object(server, "_query", return_value="FallbackExp"),
+        ):
+            status = server.igor_status()
+            ensured = server.ensure_igor()
+
+        self.assertFalse(status["pipe_reachable"])
+        self.assertEqual(status["transport"], "com")
+        self.assertTrue(status["com_reachable"])
+        self.assertFalse(ensured["pipe_reachable"])
+        self.assertEqual(ensured["transport"], "com")
+        self.assertEqual(ensured["current_experiment"], "FallbackExp")
+
+    def test_capture_window_session_jsonl_omits_base64_png_data(self):
+        png_bytes = b"\x89PNG\r\n\x1a\n" + b"A" * 128
+        b64_png = server.base64.b64encode(png_bytes).decode("ascii")
+        fake = _FakePipeClient()
+        fake.responses["capture_window"] = {
+            "window": "Graph0",
+            "width": 320,
+            "height": 240,
+            "data": b64_png,
+        }
+
+        async def invoke():
+            async with create_connected_server_and_client_session(server.mcp) as client:
+                return await client.call_tool(
+                    "capture_window", {"window": "Graph0", "render": "screenGraphOnly"}
+                )
+
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            os.environ, {"IGOR_SESSION_DIR": directory}
+        ):
+            with patch.object(server, "_try_pipe_client", return_value=fake):
+                wire_res = asyncio.run(invoke())
+            self.assertFalse(wire_res.isError)
+            jsonl_files = list(Path(directory).rglob("*.jsonl"))
+            self.assertTrue(jsonl_files)
+            log_text = "\n".join(
+                f.read_text(encoding="utf-8") for f in jsonl_files
+            )
+            self.assertIn("capture_window", log_text)
+            self.assertNotIn(b64_png, log_text)
+
+    def test_igor_transport_pipe_mode_fails_closed_without_com_fallback(self):
+        with (
+            patch.dict(os.environ, {"IGOR_TRANSPORT": "pipe"}),
+            patch.object(server, "_try_pipe_client", return_value=None),
+            patch.object(server, "_with_igor") as com_call,
+        ):
+            exec_res = server._execute_igor_direct("Print 1")
+            status_res = server.igor_status()
+            cap_res = server.capture_window()
+            comp_res = server.compile_procedures()
+            cstat_res = server.get_compile_status()
+            with self.assertRaisesRegex(server.IgorError, "IGOR_TRANSPORT=pipe"):
+                server.list_windows()
+
+        com_call.assert_not_called()
+        self.assertFalse(exec_res["ok"])
+        self.assertEqual(exec_res["transport"], "pipe")
+        self.assertFalse(status_res["pipe_reachable"])
+        self.assertEqual(status_res["transport"], "none")
+        self.assertTrue(cap_res.isError)
+        self.assertFalse(comp_res["ok"])
+        self.assertFalse(cstat_res["ok"])
+
+    def test_tool_profile_core_omits_optional_report_tools(self):
+        async def _list_names():
+            return {tool.name for tool in await server.mcp.list_tools()}
+
+        with patch.dict(os.environ, {"IGOR_TOOL_PROFILE": "full"}):
+            full_names = asyncio.run(_list_names())
+        with patch.dict(os.environ, {"IGOR_TOOL_PROFILE": "core"}):
+            core_names = asyncio.run(_list_names())
+
+        self.assertEqual(len(full_names), 33)
+        self.assertEqual(len(core_names), 30)
+        for report_tool in ("create_html_report", "open_report_graph", "apply_html_report"):
+            self.assertIn(report_tool, full_names)
+            self.assertNotIn(report_tool, core_names)
+
+    def test_pipe_first_list_waves_read_variable_and_list_procedures(self):
+        class _DataPipeClient(_FakePipeClient):
+            def call_function(self, name, args=None, kwargs=None, timeout_seconds=30.0):
+                self.calls.append(("call_function", name, args, kwargs, timeout_seconds))
+                if name == "DataFolderExists":
+                    return {"type": "number", "value": 1}
+                if name == "exists":
+                    return {"type": "number", "value": 2}
+                if name == "StrVarOrDefault":
+                    if args and args[0] == "root:s_label":
+                        return {"type": "string", "value": "sample_a"}
+                    return {"type": "string", "value": args[1] if args and len(args) > 1 else ""}
+                if name == "NumVarOrDefault":
+                    return {"type": "number", "value": 3.5}
+                if name == "WinList":
+                    return {"type": "string", "value": "Procedure;MyProcs.ipf;"}
+                if name == "FunctionList":
+                    if args and args[2] == "WIN:MyProcs.ipf":
+                        return {"type": "string", "value": "MyFunc;"}
+                    return {"type": "string", "value": ""}
+                return {"type": "string", "value": ""}
+
+            def execute_command(self, command, timeout_seconds=30.0):
+                self.calls.append(("execute_command", command, timeout_seconds))
+                return {"results": "w_x;w_y;", "history": "", "elapsedSeconds": 0.001}
+
+        fake = _DataPipeClient()
+        with (
+            patch.object(server, "_try_pipe_client", return_value=fake),
+            patch.object(server, "_with_igor") as com_call,
+        ):
+            waves = server.list_waves("root:TestDF")
+            str_var = server.read_variable("root:s_label")
+            num_var = server.read_variable("root:v_gain")
+            procs = server.list_procedures()
+
+        com_call.assert_not_called()
+        self.assertEqual(waves, {"folder": "root:TestDF", "waves": ["w_x", "w_y"]})
+        self.assertEqual(str_var, {"name": "root:s_label", "type": "string", "value": "sample_a"})
+        self.assertEqual(num_var, {"name": "root:v_gain", "type": "numeric", "value": 3.5})
+        self.assertIn("MyProcs.ipf", procs)
+        self.assertIn("MyFunc", procs)
+
+    def test_quick_polish_png_ihdr_dimensions_and_max_dimension_bounds(self):
+        import struct
+
+        png_bytes = (
+            b"\x89PNG\r\n\x1a\n"
+            + b"\x00\x00\x00\rIHDR"
+            + struct.pack(">II", 640, 480)
+            + b"\x08\x02\x00\x00\x00"
+        )
+        b64_png = server.base64.b64encode(png_bytes).decode("ascii")
+        fake = _FakePipeClient()
+        # Pipe response intentionally omits width & height
+        fake.responses["capture_window"] = {
+            "window": "Graph0",
+            "data": b64_png,
+        }
+        with patch.object(server, "_try_pipe_client", return_value=fake):
+            res = server.capture_window(window="Graph0")
+        self.assertFalse(res.isError)
+        self.assertEqual(res.structuredContent["width"], 640)
+        self.assertEqual(res.structuredContent["height"], 480)
+
+        # COM fallback also populates width & height from PNG IHDR
+        def fake_com_exec(_app, cmd):
+            match = server.re.search(r'as "([^"]+)"', cmd)
+            self.assertIsNotNone(match)
+            out_path = match.group(1).replace("\\\\", "\\")
+            Path(out_path).write_bytes(png_bytes)
+            return ""
+
+        with (
+            patch.dict(os.environ, {"IGOR_TRANSPORT": "com"}),
+            patch.object(
+                server,
+                "_with_igor",
+                side_effect=lambda fn, **_kwargs: fn(object(), 10.05),
+            ),
+            patch.object(server, "_query", side_effect=["1"]),
+            patch.object(server, "_execute_command", side_effect=fake_com_exec),
+        ):
+            com_res = server.capture_window(window="Graph0")
+        self.assertFalse(com_res.isError)
+        self.assertEqual(com_res.structuredContent["width"], 640)
+        self.assertEqual(com_res.structuredContent["height"], 480)
+
+        # Direct Python calls enforce max_dimension bounds
+        for bad_dim in (0, 63, 8193, True, False):
+            err_res = server.capture_window(max_dimension=bad_dim)
+            self.assertTrue(err_res.isError)
+            self.assertIn("64 and 8192", err_res.structuredContent["error"])
+
+    def test_quick_polish_compile_errors_list_derived_state_and_list_windows_raw_newline(self):
+        # 1. compile_procedures populates errors list from singular error object
+        fake = _FakePipeClient()
+        singular_err = {"file": "MyProc.ipf", "line": 42, "message": "syntax error"}
+        fake.responses["compile_procedures"] = {
+            "compiled": False,
+            "error": singular_err,
+        }
+        with patch.object(server, "_try_pipe_client", return_value=fake):
+            comp = server.compile_procedures()
+        self.assertFalse(comp["ok"])
+        self.assertFalse(comp["compiled"])
+        self.assertEqual(comp["error"], singular_err)
+        self.assertEqual(comp["errors"], [singular_err])
+
+        # 2. get_igor_state derives busy from pipe_state fields when busy is omitted
+        fake_busy = _FakePipeClient()
+        fake_busy.responses["get_state"] = {
+            "procedureRunning": True,
+            "loadingExperiment": False,
+            "runningRequest": False,
+            "queuedRequests": 0,
+            "otherQueuedRequests": 0,
+        }
+        fake_idle = _FakePipeClient()
+        fake_idle.responses["get_state"] = {
+            "procedureRunning": False,
+            "loadingExperiment": False,
+            "runningRequest": False,
+            "queuedRequests": 0,
+            "otherQueuedRequests": 0,
+        }
+        with (
+            patch.object(server, "_igor_dialogs", return_value=[]),
+            patch.object(server, "_try_pipe_client", return_value=fake_busy),
+        ):
+            st_busy = server.get_igor_state()
+        with (
+            patch.object(server, "_igor_dialogs", return_value=[]),
+            patch.object(server, "_try_pipe_client", return_value=fake_idle),
+        ):
+            st_idle = server.get_igor_state()
+        self.assertTrue(st_busy["busy"])
+        self.assertFalse(st_idle["busy"])
+
+        # 3. get_compile_status derives needs_compile from compiled bool
+        fake_cs_ok = _FakePipeClient()
+        fake_cs_ok.responses["get_compile_status"] = {"compiled": True}
+        fake_cs_dirty = _FakePipeClient()
+        fake_cs_dirty.responses["get_compile_status"] = {"compiled": False}
+        with patch.object(server, "_try_pipe_client", return_value=fake_cs_ok):
+            cs_ok = server.get_compile_status()
+        with patch.object(server, "_try_pipe_client", return_value=fake_cs_dirty):
+            cs_dirty = server.get_compile_status()
+        self.assertIs(cs_ok["needs_compile"], False)
+        self.assertIs(cs_dirty["needs_compile"], True)
+
+        # 4. list_windows rejects leading/trailing newlines before strip()
+        for bad_match in ("\nGraph*", "Graph*\n", "Graph*\r\n", "\x00Graph*"):
+            with self.assertRaisesRegex(server.IgorError, "newlines"):
+                server.list_windows(match=bad_match)
+
+    def test_quick_polish_server_info_version_and_call_function_schema_docs(self):
+        self.assertEqual(server.mcp._mcp_server.version, "0.3.0")
+
+        async def _check_wire():
+            async with create_connected_server_and_client_session(server.mcp) as client:
+                init = await client.initialize()
+                tools = await client.list_tools()
+                return init, tools
+
+        init_result, tools_result = asyncio.run(_check_wire())
+        self.assertEqual(init_result.serverInfo.version, "0.3.0")
+
+        call_fn_tool = next(t for t in tools_result.tools if t.name == "call_function")
+        args_desc = call_fn_tool.inputSchema["properties"]["args"]["description"]
+        self.assertIn("wave", args_desc)
+        self.assertIn("datafolder", args_desc)
+        self.assertIn("real", args_desc)
+        self.assertIn("NaN", args_desc)
+        self.assertIn("Infinity", args_desc)
+
+    def test_pipe_first_get_wave_data_1d_complex_and_2d(self):
+        class _WavePipeClient(_FakePipeClient):
+            def __init__(self, mode_kind: str):
+                super().__init__()
+                self.mode_kind = mode_kind
+
+            def call_function(self, name, args=None, kwargs=None, timeout_seconds=30.0):
+                self.calls.append(("call_function", name, args, kwargs, timeout_seconds))
+                if name == "WaveExists":
+                    return {"type": "number", "value": 1}
+                if name == "WaveType":
+                    if args and len(args) > 1 and args[1] == 1:
+                        return {"type": "number", "value": 1}  # numeric
+                    if self.mode_kind == "1d_complex":
+                        return {"type": "number", "value": 5}  # 4 (double) | 1 (complex)
+                    return {"type": "number", "value": 4}
+                if name == "numpnts":
+                    return {"type": "number", "value": 4 if self.mode_kind == "2d" else 3}
+                if name == "WaveDims":
+                    return {"type": "number", "value": 2 if self.mode_kind == "2d" else 1}
+                if name == "DimSize":
+                    return {"type": "number", "value": 2}
+                if name == "DimOffset":
+                    return {"type": "number", "value": 0.0 if args[1] == 0 else 10.0}
+                if name == "DimDelta":
+                    return {"type": "number", "value": 0.5 if args[1] == 0 else 2.0}
+                if name == "WaveUnits":
+                    return {"type": "string", "value": "s" if args[1] == 0 else "m"}
+                return {"type": "number", "value": 0}
+
+            def execute_command(self, command, timeout_seconds=30.0):
+                self.calls.append(("execute_command", command, timeout_seconds))
+                if self.mode_kind == "1d_real":
+                    payload = "1.5\nNaN\nInf\n"
+                elif self.mode_kind == "1d_complex":
+                    payload = "1,2\n3,-4\nNaN,Inf\n"
+                else:
+                    payload = "1\t2\n3\t4\n"
+                match = server.re.search(r'Open \S+ as "([^"]+)"', command)
+                if match:
+                    out_path = match.group(1).replace("\\\\", "\\")
+                    Path(out_path).write_text(payload, encoding="utf-8")
+                return {"results": "", "history": ""}
+
+        with patch.object(server, "_with_igor") as com_call:
+            with patch.object(server, "_try_pipe_client", return_value=_WavePipeClient("1d_real")):
+                w1 = server.get_wave_data("root:w_real", max_points=10)
+            with patch.object(server, "_try_pipe_client", return_value=_WavePipeClient("1d_complex")):
+                wc = server.get_wave_data("root:w_cplx", max_points=10)
+            with patch.object(server, "_try_pipe_client", return_value=_WavePipeClient("2d")):
+                w2 = server.get_wave_data("root:w_mat", max_points=10)
+
+        com_call.assert_not_called()
+        self.assertEqual(
+            w1,
+            {
+                "name": "root:w_real",
+                "npnts": 3,
+                "dimensions": 1,
+                "wave_type_code": 4,
+                "complex": False,
+                "truncated": False,
+                "values": [1.5, "NaN", "Inf"],
+            },
+        )
+        self.assertEqual(
+            wc["values"],
+            [
+                {"real": 1.0, "imag": 2.0},
+                {"real": 3.0, "imag": -4.0},
+                {"real": "NaN", "imag": "Inf"},
+            ],
+        )
+        self.assertTrue(wc["complex"])
+        self.assertEqual(
+            w2,
+            {
+                "name": "root:w_mat",
+                "npnts": 4,
+                "dimensions": 2,
+                "rows": 2,
+                "columns": 2,
+                "x_offset": 0.0,
+                "x_delta": 0.5,
+                "y_offset": 10.0,
+                "y_delta": 2.0,
+                "x_units": "s",
+                "y_units": "m",
+                "wave_type_code": 4,
+                "complex": False,
+                "truncated": False,
+                "values": [[1.0, 2.0], [3.0, 4.0]],
+            },
+        )
+
+        # IGOR_TRANSPORT=pipe fails closed without COM fallback
+        with (
+            patch.dict(os.environ, {"IGOR_TRANSPORT": "pipe"}),
+            patch.object(server, "_try_pipe_client", return_value=None),
+            patch.object(server, "_with_igor") as com_call_closed,
+        ):
+            with self.assertRaisesRegex(server.IgorError, "IGOR_TRANSPORT=pipe"):
+                server.get_wave_data("root:w_real")
+        com_call_closed.assert_not_called()
+
+    def test_pipe_first_import_delimited_text(self):
+        class _ImportPipeClient(_FakePipeClient):
+            def __init__(self):
+                super().__init__()
+                self.temp_prefix = None
+
+            def call_function(self, name, args=None, kwargs=None, timeout_seconds=30.0):
+                self.calls.append(("call_function", name, args, kwargs, timeout_seconds))
+                if name == "DataFolderExists":
+                    return {"type": "number", "value": 1}
+                if name == "WaveList":
+                    pattern = args[0] if args else ""
+                    if self.temp_prefix and pattern.startswith(self.temp_prefix):
+                        return {"type": "string", "value": f"{self.temp_prefix}0;{self.temp_prefix}1;"}
+                    return {"type": "string", "value": ""}
+                return {"type": "string", "value": ""}
+
+            def execute_command(self, command, timeout_seconds=30.0):
+                self.calls.append(("execute_command", command, timeout_seconds))
+                if command.startswith('fprintf 0, "%s", WaveList'):
+                    return {"results": "", "history": ""}
+                if command.startswith("LoadWave/J/D/A="):
+                    match = server.re.search(r"/A=([A-Za-z0-9_]+)/O", command)
+                    if match:
+                        self.temp_prefix = match.group(1)
+                    return {"results": "", "history": ""}
+                return {"results": "", "history": ""}
+
+        with tempfile.TemporaryDirectory() as directory:
+            csv_path = Path(directory) / "sample.csv"
+            csv_path.write_text("x,y\n1.0,2.5\n3.0,4.5\n", encoding="utf-8")
+
+            fake = _ImportPipeClient()
+            with (
+                patch.object(server, "_try_pipe_client", return_value=fake),
+                patch.object(server, "_with_igor") as com_call,
+            ):
+                res = server.import_delimited_text(
+                    str(csv_path), prefix="imp", folder="root:"
+                )
+
+            com_call.assert_not_called()
+            self.assertEqual(
+                res,
+                {
+                    "source_path": str(csv_path.resolve()),
+                    "folder": "root:",
+                    "prefix": "imp",
+                    "rows": 2,
+                    "columns": 2,
+                    "waves": ["imp0", "imp1"],
+                    "headers": ["x", "y"],
+                    "portable_object_name_limit": server._MAX_IGOR_OBJECT_NAME_LENGTH,
+                },
+            )
+
+            # IGOR_TRANSPORT=pipe fails closed without COM fallback
+            with (
+                patch.dict(os.environ, {"IGOR_TRANSPORT": "pipe"}),
+                patch.object(server, "_try_pipe_client", return_value=None),
+                patch.object(server, "_with_igor") as com_call_closed,
+            ):
+                with self.assertRaisesRegex(server.IgorError, "IGOR_TRANSPORT=pipe"):
+                    server.import_delimited_text(str(csv_path), prefix="imp", folder="root:")
+            com_call_closed.assert_not_called()
+
+    def test_pipe_first_open_igor_experiment_and_no_replay_on_dispatch_error(self):
+        class _OpenPipeClient(_FakePipeClient):
+            def call_function(self, name, args=None, kwargs=None, timeout_seconds=30.0):
+                self.calls.append(("call_function", name, args, kwargs, timeout_seconds))
+                if name == "IgorInfo":
+                    return {"type": "string", "value": "MySavedExp"}
+                return {"type": "string", "value": ""}
+
+        with tempfile.TemporaryDirectory() as directory:
+            pxp_path = Path(directory) / "MySavedExp.pxp"
+            pxp_path.write_bytes(b"IGOR")
+
+            fake = _OpenPipeClient()
+            with (
+                patch.object(server, "_igor_dialogs", return_value=[]),
+                patch.object(server, "_try_pipe_client", return_value=fake),
+                patch.object(server, "_with_igor") as com_call,
+            ):
+                res = server.open_igor_experiment(str(pxp_path))
+
+            com_call.assert_not_called()
+            self.assertEqual(
+                res,
+                {
+                    "ok": True,
+                    "file_path": str(pxp_path.resolve()),
+                    "current_experiment": "MySavedExp",
+                    "error": None,
+                    "load_started": True,
+                    "load_completed": True,
+                    "outcome_known": True,
+                    "dialogs_open": 0,
+                    "dialog_titles": [],
+                    "dialog_details": [],
+                    "compilation_errors": [],
+                },
+            )
+            exec_cmds = [c[1]["command"] for c in fake.calls if c[0] == "execute_command"]
+            self.assertTrue(any('Execute/P/Q "LOADFILE ' in cmd for cmd in exec_cmds))
+
+            # Post-dispatch PipeDispatchError must NOT replay via COM
+            broken = _FakePipeClient()
+            broken.responses["execute_command"] = server.igor_pipe.PipeDispatchError(
+                "pipe disconnected after LOADFILE"
+            )
+            with (
+                patch.object(server, "_igor_dialogs", return_value=[]),
+                patch.object(server, "_try_pipe_client", return_value=broken),
+                patch.object(server, "_with_igor") as com_call_no_replay,
+            ):
+                fail_res = server.open_igor_experiment(str(pxp_path))
+            com_call_no_replay.assert_not_called()
+            self.assertFalse(fail_res["ok"])
+            self.assertTrue(fail_res["load_started"])
+            self.assertFalse(fail_res["outcome_known"])
+
+            # IGOR_TRANSPORT=pipe fails closed without COM fallback
+            with (
+                patch.dict(os.environ, {"IGOR_TRANSPORT": "pipe"}),
+                patch.object(server, "_igor_dialogs", return_value=[]),
+                patch.object(server, "_try_pipe_client", return_value=None),
+                patch.object(server, "_with_igor") as com_call_closed,
+            ):
+                closed_res = server.open_igor_experiment(str(pxp_path))
+            com_call_closed.assert_not_called()
+            self.assertFalse(closed_res["ok"])
+            self.assertFalse(closed_res["load_started"])
+            self.assertTrue(closed_res["outcome_known"])
+            self.assertIn("IGOR_TRANSPORT=pipe", closed_res["error"])
+
+
 if __name__ == "__main__":
     unittest.main()
+

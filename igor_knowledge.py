@@ -8,13 +8,15 @@ paths supplied by a caller.  This keeps document identifiers stable and makes
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import hashlib
 import json
 import os
 import re
-from functools import lru_cache
+import stat
+import threading
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, NamedTuple
 
 
 _PACKAGE_DIR = Path(__file__).resolve().parent
@@ -22,38 +24,184 @@ _KNOWLEDGE_DIR = Path(
     os.environ.get("IGOR_KNOWLEDGE_DIR", str(_PACKAGE_DIR / "knowledge"))
 ).expanduser().resolve()
 _MANIFEST_PATH = _KNOWLEDGE_DIR / "manifest.json"
+_INITIAL_KNOWLEDGE_DIR = _KNOWLEDGE_DIR
+_INITIAL_MANIFEST_PATH = _MANIFEST_PATH
 
 _MAX_QUERY_CHARS = 4_096
 _MAX_RESULTS = 20
 _DEFAULT_MAX_CHARS = 20_000
 _MAX_READ_CHARS = 200_000
 _MAX_EXCERPT_CHARS = 700
+_MAX_CACHED_ROOTS = 8
 _KNOWLEDGE_TIERS = frozenset({"core-reference", "on-demand"})
 _HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*#*\s*$")
+_PARAGRAPH_SEPARATOR_RE = re.compile(r"(?:\r?\n)[ \t]*(?:\r?\n)+")
 _COMMAND_RE = re.compile(
     r"^[A-Za-z_][A-Za-z0-9_]*(?:/[A-Za-z0-9_.,=+*?()/-]+)?$"
 )
+_COMMAND_ROOT_RE = re.compile(r"[A-Za-z]+")
+_TERM_RE = re.compile(r"[A-Za-z0-9_]+")
 
 
-def _load_manifest() -> dict[str, Any]:
+class _IndexedSection(NamedTuple):
+    heading: str
+    heading_folded: str
+    block: str
+    block_folded: str
+    read_offset: int
+
+
+@dataclass
+class _IndexedDocument:
+    document_id: str
+    path: Path
+    file_sig: tuple[int, int]
+    expected_hash: str
+    collection: Any
+    knowledge_tier: str
+    file_stem: str
+    title: str
+    title_folded: str
+    source_path: Any
+    topic_haystack: str
+    text: str
+    full_folded: str
+    sections: tuple[_IndexedSection, ...] | None = None
+
+
+class _KnowledgeIndex:
+    """In-memory index for a single resolved knowledge root."""
+
+    def __init__(
+        self,
+        *,
+        root: Path,
+        manifest_path: Path,
+        manifest_sig: tuple[int, int],
+        manifest: dict[str, Any],
+        documents: tuple[dict[str, Any], ...],
+    ) -> None:
+        self.root = root
+        self.manifest_path = manifest_path
+        self.manifest_sig = manifest_sig
+        self.manifest = manifest
+        self.documents = documents
+        self.document_by_id = {document["id"]: document for document in documents}
+        self.entries: dict[str, _IndexedDocument] = {}
+        self.stats_hits = 0
+        self.stats_misses = 0
+
+    def collection_documents(self, collection: object) -> tuple[dict[str, Any], ...]:
+        if collection is None:
+            return self.documents
+        if not isinstance(collection, str):
+            raise ValueError("collection must be 'manuals', 'guides', or 'all'")
+        normalized = collection.strip().lower()
+        if normalized == "all":
+            return self.documents
+        aliases = {"official": "manuals", "curated": "guides"}
+        normalized = aliases.get(normalized, normalized)
+        if normalized not in {"manuals", "guides"}:
+            raise ValueError("collection must be 'manuals', 'guides', or 'all'")
+        return tuple(
+            document for document in self.documents if document.get("collection") == normalized
+        )
+
+
+_INDEX_LOCK = threading.RLock()
+_INDEX_CACHE: dict[Path, _KnowledgeIndex] = {}
+
+
+def _stat_signature(path: Path) -> tuple[int, int]:
+    st = os.stat(path)
+    return (st.st_mtime_ns, st.st_size)
+
+
+def _load_manifest_from(manifest_path: Path) -> dict[str, Any]:
     try:
-        value = json.loads(_MANIFEST_PATH.read_text(encoding="utf-8"))
+        value = json.loads(manifest_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:  # pragma: no cover - bad install
-        raise RuntimeError(f"Knowledge manifest cannot be loaded: {_MANIFEST_PATH}") from exc
+        raise RuntimeError(f"Knowledge manifest cannot be loaded: {manifest_path}") from exc
     if not isinstance(value, dict) or not isinstance(value.get("documents"), list):
         raise RuntimeError("Knowledge manifest has no document list")
     return value
 
 
+def _load_manifest() -> dict[str, Any]:
+    return _load_manifest_from(_MANIFEST_PATH)
+
+
+def _parse_manifest_documents(manifest: dict[str, Any]) -> tuple[dict[str, Any], ...]:
+    return tuple(
+        document
+        for document in manifest["documents"]
+        if isinstance(document, dict)
+        and isinstance(document.get("id"), str)
+        and isinstance(document.get("path"), str)
+    )
+
+
 _MANIFEST = _load_manifest()
-_DOCUMENTS = tuple(
-    document
-    for document in _MANIFEST["documents"]
-    if isinstance(document, dict)
-    and isinstance(document.get("id"), str)
-    and isinstance(document.get("path"), str)
-)
+_DOCUMENTS = _parse_manifest_documents(_MANIFEST)
 _DOCUMENT_BY_ID = {document["id"]: document for document in _DOCUMENTS}
+_INITIAL_MANIFEST_SIG = _stat_signature(_MANIFEST_PATH)
+
+
+def _resolve_root_and_manifest() -> tuple[Path, Path]:
+    root = _KNOWLEDGE_DIR.resolve()
+    if _MANIFEST_PATH != _INITIAL_MANIFEST_PATH:
+        manifest_path = _MANIFEST_PATH.resolve()
+    else:
+        manifest_path = (root / "manifest.json").resolve()
+    return root, manifest_path
+
+
+def _get_index() -> _KnowledgeIndex:
+    root, manifest_path = _resolve_root_and_manifest()
+    try:
+        manifest_sig = _stat_signature(manifest_path)
+    except OSError as exc:  # pragma: no cover - bad install
+        raise RuntimeError(f"Knowledge manifest cannot be loaded: {manifest_path}") from exc
+
+    with _INDEX_LOCK:
+        cached = _INDEX_CACHE.get(root)
+        if (
+            cached is not None
+            and cached.manifest_path == manifest_path
+            and cached.manifest_sig == manifest_sig
+        ):
+            return cached
+
+        if (
+            root == _INITIAL_KNOWLEDGE_DIR
+            and manifest_path == _INITIAL_MANIFEST_PATH
+            and manifest_sig == _INITIAL_MANIFEST_SIG
+        ):
+            manifest = _MANIFEST
+            documents = _DOCUMENTS
+        else:
+            manifest = _load_manifest_from(manifest_path)
+            documents = _parse_manifest_documents(manifest)
+
+        index = _KnowledgeIndex(
+            root=root,
+            manifest_path=manifest_path,
+            manifest_sig=manifest_sig,
+            manifest=manifest,
+            documents=documents,
+        )
+        if len(_INDEX_CACHE) >= _MAX_CACHED_ROOTS and root not in _INDEX_CACHE:
+            oldest_key = next(iter(_INDEX_CACHE))
+            _INDEX_CACHE.pop(oldest_key, None)
+        _INDEX_CACHE[root] = index
+        return index
+
+
+def clear_cache() -> None:
+    """Clear all cached knowledge indexes and document entries."""
+
+    with _INDEX_LOCK:
+        _INDEX_CACHE.clear()
 
 
 def _knowledge_tier(document: dict[str, Any]) -> str:
@@ -99,7 +247,12 @@ def _collection_documents(collection: object) -> tuple[dict[str, Any], ...]:
     return tuple(document for document in _DOCUMENTS if document.get("collection") == normalized)
 
 
-def _safe_document_path(document_id: str, document: dict[str, Any]) -> Path:
+def _safe_document_path(
+    document_id: str,
+    document: dict[str, Any],
+    *,
+    root: Path | None = None,
+) -> Path:
     """Resolve a manifest path while rejecting traversal and non-bundled files."""
 
     candidate_id = PurePosixPath(document_id)
@@ -122,30 +275,110 @@ def _safe_document_path(document_id: str, document: dict[str, Any]) -> Path:
     ):
         raise RuntimeError(f"Manifest path is unsafe: {relative_path}")
 
-    root = _KNOWLEDGE_DIR.resolve()
-    path = (root / Path(*relative.parts)).resolve()
+    resolved_root = _KNOWLEDGE_DIR.resolve() if root is None else root
+    path = (resolved_root / Path(*relative.parts)).resolve()
     try:
-        path.relative_to(root)
+        path.relative_to(resolved_root)
     except ValueError as exc:  # pragma: no cover - invalid manifest
         raise RuntimeError(f"Manifest path escapes knowledge directory: {relative_path}") from exc
-    if not path.is_file():
+    try:
+        st = os.stat(path)
+    except OSError as exc:
+        raise FileNotFoundError(f"Bundled knowledge document is missing: {document_id}") from exc
+    if not stat.S_ISREG(st.st_mode):
         raise FileNotFoundError(f"Bundled knowledge document is missing: {document_id}")
     return path
 
 
-@lru_cache(maxsize=128)
+def _resolve_document_record(index: _KnowledgeIndex, document_id: str) -> dict[str, Any] | None:
+    if (
+        index.root == _INITIAL_KNOWLEDGE_DIR
+        and index.manifest_path == _INITIAL_MANIFEST_PATH
+        and index.manifest_sig == _INITIAL_MANIFEST_SIG
+    ):
+        return _DOCUMENT_BY_ID.get(document_id)
+    return index.document_by_id.get(document_id)
+
+
+def _get_entry(index: _KnowledgeIndex, document: dict[str, Any]) -> _IndexedDocument:
+    document_id = str(document["id"])
+    raw_expected_hash = document.get("bundle_sha256")
+    expected_hash = raw_expected_hash.upper() if isinstance(raw_expected_hash, str) and raw_expected_hash else ""
+
+    with _INDEX_LOCK:
+        cached = index.entries.get(document_id)
+
+    if cached is not None and cached.expected_hash == expected_hash:
+        try:
+            current_sig = _stat_signature(cached.path)
+        except OSError:
+            current_sig = None
+        if current_sig == cached.file_sig:
+            with _INDEX_LOCK:
+                index.stats_hits += 1
+            return cached
+
+    path = _safe_document_path(document_id, document, root=index.root)
+    file_sig = _stat_signature(path)
+    raw = path.read_bytes()
+    if expected_hash:
+        actual_hash = hashlib.sha256(raw).hexdigest().upper()
+        if actual_hash != expected_hash:
+            raise RuntimeError(f"Bundled knowledge hash mismatch: {document_id}")
+    text = raw.decode("utf-8")
+    title = _document_title(document, text)
+    title_folded = title.casefold()
+    source_path = document.get("source_path")
+    entry = _IndexedDocument(
+        document_id=document_id,
+        path=path,
+        file_sig=file_sig,
+        expected_hash=expected_hash,
+        collection=document.get("collection"),
+        knowledge_tier=_knowledge_tier(document),
+        file_stem=Path(str(document["path"])).stem,
+        title=title,
+        title_folded=title_folded,
+        source_path=source_path,
+        topic_haystack=(document_id + " " + title + " " + str(source_path or "")).casefold(),
+        text=text,
+        full_folded=title_folded + " " + text.casefold(),
+    )
+    with _INDEX_LOCK:
+        index.entries[document_id] = entry
+        index.stats_misses += 1
+    return entry
+
+
+def _get_sections(entry: _IndexedDocument) -> tuple[_IndexedSection, ...]:
+    sections = entry.sections
+    if sections is not None:
+        return sections
+    computed = tuple(
+        _IndexedSection(
+            heading=heading,
+            heading_folded=heading.casefold(),
+            block=block,
+            block_folded=block.casefold(),
+            read_offset=read_offset,
+        )
+        for heading, block, read_offset in _sections(entry.text)
+    )
+    with _INDEX_LOCK:
+        if entry.sections is None:
+            entry.sections = computed
+        return entry.sections
+
+
 def _read_text(document_id: str) -> str:
-    document = _DOCUMENT_BY_ID.get(document_id)
+    index = _get_index()
+    document = _resolve_document_record(index, document_id)
     if document is None:
         raise ValueError(f"Unknown document_id: {document_id}")
-    path = _safe_document_path(document_id, document)
-    raw = path.read_bytes()
-    expected_hash = document.get("bundle_sha256")
-    if isinstance(expected_hash, str) and expected_hash:
-        actual_hash = hashlib.sha256(raw).hexdigest().upper()
-        if actual_hash != expected_hash.upper():
-            raise RuntimeError(f"Bundled knowledge hash mismatch: {document_id}")
-    return raw.decode("utf-8")
+    return _get_entry(index, document).text
+
+
+_read_text.cache_clear = clear_cache  # type: ignore[attr-defined]
 
 
 def _document_title(document: dict[str, Any], text: str) -> str:
@@ -178,12 +411,11 @@ def _sections(text: str) -> tuple[tuple[str, str, int], ...]:
     if text[block_start:len(text)].strip():
         blocks.append((heading, block_start, len(text)))
 
-    paragraph_separator = re.compile(r"(?:\r?\n)[ \t]*(?:\r?\n)+")
     expanded: list[tuple[str, str, int]] = []
     for section_heading, start, end in blocks:
         section_text = text[start:end]
         paragraph_start = 0
-        for separator in paragraph_separator.finditer(section_text):
+        for separator in _PARAGRAPH_SEPARATOR_RE.finditer(section_text):
             paragraph = section_text[paragraph_start:separator.start()]
             trimmed = paragraph.strip()
             if trimmed:
@@ -223,7 +455,7 @@ def _score(query: str, title: str, heading: str, block: str) -> int:
     title_folded = title.casefold()
     heading_folded = heading.casefold()
     block_folded = block.casefold()
-    terms = [term.casefold() for term in re.findall(r"[A-Za-z0-9_]+", query) if len(term) >= 2]
+    terms = [term.casefold() for term in _TERM_RE.findall(query) if len(term) >= 2]
     haystack = title_folded + " " + heading_folded + " " + block_folded
     if query_folded not in haystack:
         matched_terms = sum(term in haystack for term in terms)
@@ -237,7 +469,7 @@ def _score(query: str, title: str, heading: str, block: str) -> int:
     elif query_folded in title_folded:
         score += 60
     if _COMMAND_RE.fullmatch(query):
-        command_root = re.match(r"[A-Za-z]+", query)
+        command_root = _COMMAND_ROOT_RE.match(query)
         if command_root and command_root.group(0).casefold() in title_folded:
             score += 90
         if "reference" in title_folded:
@@ -253,8 +485,9 @@ def _score(query: str, title: str, heading: str, block: str) -> int:
     # matters for queries such as CurveFit, WaveStats, SetScale/P, and pnt2x.
     if _COMMAND_RE.fullmatch(query):
         exact = re.compile(r"(?<![A-Za-z0-9_])" + re.escape(query) + r"(?![A-Za-z0-9_])", re.IGNORECASE)
-        score += 120 * min(1, len(exact.findall(block)))
-    score += 45 * min(1, block_folded.count(query_folded))
+        score += 120 * (1 if exact.search(block) is not None else 0)
+    if query_folded in block_folded:
+        score += 45
 
     for term in terms:
         score += 12 * min(2, heading_folded.count(term))
@@ -282,7 +515,8 @@ def search(
         result_limit = _bounded_limit(
             max_results, label="max_results", default=3, maximum=_MAX_RESULTS
         )
-        documents = _collection_documents(collection)
+        index = _get_index()
+        documents = index.collection_documents(collection)
     except ValueError as exc:
         return {
             "query": query if isinstance(query, str) else "",
@@ -292,53 +526,117 @@ def search(
             "error": str(exc),
             "results": [],
         }
-    candidates: list[dict[str, Any]] = []
+
+    query_folded = cleaned_query.casefold()
+    topic_folded = cleaned_topic.casefold() if cleaned_topic else None
+    terms = tuple(term.casefold() for term in _TERM_RE.findall(cleaned_query) if len(term) >= 2)
+    is_command = bool(_COMMAND_RE.fullmatch(cleaned_query))
+    command_root_match = _COMMAND_ROOT_RE.match(cleaned_query) if is_command else None
+    command_root_folded = command_root_match.group(0).casefold() if command_root_match else None
+    exact_re = (
+        re.compile(
+            r"(?<![A-Za-z0-9_])" + re.escape(cleaned_query) + r"(?![A-Za-z0-9_])",
+            re.IGNORECASE,
+        )
+        if is_command
+        else None
+    )
+
+    best_per_document: list[tuple[int, str, str, _IndexedDocument, _IndexedSection]] = []
 
     for document in documents:
-        document_id = str(document["id"])
-        text = _read_text(document_id)
-        title = _document_title(document, text)
-        if cleaned_topic and cleaned_topic.casefold() not in (
-            document_id + " " + title + " " + str(document.get("source_path", ""))
-        ).casefold():
+        entry = _get_entry(index, document)
+        if topic_folded and topic_folded not in entry.topic_haystack:
             continue
-        for heading, block, read_offset in _sections(text):
-            score = _score(cleaned_query, title, heading, block)
+
+        if terms:
+            if any(term not in entry.full_folded for term in terms):
+                continue
+        elif not is_command and query_folded not in entry.full_folded:
+            continue
+
+        title_folded = entry.title_folded
+        title_score = 0
+        if query_folded == title_folded:
+            title_score += 160
+        elif query_folded in title_folded:
+            title_score += 60
+        if is_command:
+            if command_root_folded and command_root_folded in title_folded:
+                title_score += 90
+            if "reference" in title_folded:
+                title_score += 130
+            if "what's new" in title_folded or "what's changed" in title_folded:
+                title_score -= 180
+
+        remaining_terms = tuple(term for term in terms if term not in title_folded)
+        best_score = 0
+        best_section_folded = ""
+        best_section: _IndexedSection | None = None
+
+        for section in _get_sections(entry):
+            heading_folded = section.heading_folded
+            block_folded = section.block_folded
+            if remaining_terms and any(
+                term not in heading_folded and term not in block_folded
+                for term in remaining_terms
+            ):
+                continue
+
+            score = title_score
+            if query_folded == heading_folded:
+                score += 150
+            elif query_folded in heading_folded:
+                score += 85
+            if exact_re is not None and exact_re.search(section.block) is not None:
+                score += 120
+            if query_folded in block_folded:
+                score += 45
+            for term in terms:
+                if term in heading_folded:
+                    heading_count = heading_folded.count(term)
+                    score += 12 * (2 if heading_count >= 2 else heading_count)
+                if term in block_folded:
+                    block_count = block_folded.count(term)
+                    score += 3 * (2 if block_count >= 2 else block_count)
             if score <= 0:
                 continue
-            candidates.append(
-                {
-                    "document_id": document_id,
-                    "collection": document.get("collection"),
-                    "knowledge_tier": _knowledge_tier(document),
-                    "file": Path(str(document["path"])).stem,
-                    "title": title,
-                    "section": heading or title,
-                    "score": score,
-                    "excerpt": _excerpt(block, cleaned_query),
-                    "read_offset": read_offset,
-                    "source_path": document.get("source_path"),
-                }
+
+            section_folded = heading_folded or title_folded
+            if best_section is None or score > best_score or (
+                score == best_score and section_folded < best_section_folded
+            ):
+                best_score = score
+                best_section_folded = section_folded
+                best_section = section
+
+        if best_section is not None:
+            best_per_document.append(
+                (
+                    best_score,
+                    entry.document_id.casefold(),
+                    best_section_folded,
+                    entry,
+                    best_section,
+                )
             )
 
-    candidates.sort(
-        key=lambda result: (
-            -int(result["score"]),
-            str(result["document_id"]).casefold(),
-            str(result["section"]).casefold(),
-        )
-    )
-    # Return one best excerpt per document so a long reference manual cannot
-    # crowd all results with neighboring paragraphs from the same file.
-    distinct_results: list[dict[str, Any]] = []
-    seen_documents: set[str] = set()
-    for candidate in candidates:
-        document_id = str(candidate["document_id"])
-        if document_id in seen_documents:
-            continue
-        seen_documents.add(document_id)
-        distinct_results.append(candidate)
-    top_results = distinct_results[:result_limit]
+    best_per_document.sort(key=lambda item: (-item[0], item[1], item[2]))
+    top_results = [
+        {
+            "document_id": entry.document_id,
+            "collection": entry.collection,
+            "knowledge_tier": entry.knowledge_tier,
+            "file": entry.file_stem,
+            "title": entry.title,
+            "section": section.heading or entry.title,
+            "score": score,
+            "excerpt": _excerpt(section.block, cleaned_query),
+            "read_offset": section.read_offset,
+            "source_path": entry.source_path,
+        }
+        for score, _doc_id_folded, _section_folded, entry, section in best_per_document[:result_limit]
+    ]
     canonical_collection = "all" if collection is None else str(collection).strip().lower()
     canonical_collection = {"official": "manuals", "curated": "guides"}.get(
         canonical_collection, canonical_collection
@@ -362,13 +660,15 @@ def read_document(
 
     if not isinstance(document_id, str) or not document_id.strip():
         raise ValueError("document_id must be a non-empty string")
-    if document_id not in _DOCUMENT_BY_ID:
+    index = _get_index()
+    document = _resolve_document_record(index, document_id)
+    if document is None:
         raise ValueError(f"Unknown document_id: {document_id}")
     limit = _bounded_limit(
         max_chars, label="max_chars", default=_DEFAULT_MAX_CHARS, maximum=_MAX_READ_CHARS
     )
-    document = _DOCUMENT_BY_ID[document_id]
-    text = _read_text(document_id)
+    entry = _get_entry(index, document)
+    text = entry.text
     if isinstance(offset, bool) or not isinstance(offset, int):
         raise ValueError("offset must be an integer")
     if offset < 0:
@@ -381,7 +681,7 @@ def read_document(
         "document_id": document_id,
         "collection": document.get("collection"),
         "knowledge_tier": _knowledge_tier(document),
-        "title": _document_title(document, text),
+        "title": entry.title,
         "content": content,
         "truncated": offset > 0 or end_offset < len(text),
         "max_chars": limit,
@@ -394,4 +694,4 @@ def read_document(
     }
 
 
-__all__ = ["read_document", "search"]
+__all__ = ["clear_cache", "read_document", "search"]

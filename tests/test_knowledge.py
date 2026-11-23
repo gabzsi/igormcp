@@ -6,6 +6,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 SERVER_DIR = Path(__file__).resolve().parents[1]
@@ -165,6 +166,78 @@ class PublicKnowledgeBundleTests(unittest.TestCase):
             self.assertIn("external-bundle-fixture-token", loaded["content"])
             self.assertEqual(loaded["search_tier"], "core-reference")
             self.assertEqual(loaded["read_tier"], "core-reference")
+
+    def test_index_cache_hit_and_invalidation_on_file_update(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            root = Path(scratch).resolve()
+            (root / "official").mkdir()
+            doc_path = root / "official" / "sample.md"
+            initial_bytes = b"# SampleCommand\nInitialAlphaToken documentation.\n"
+            doc_path.write_bytes(initial_bytes)
+            manifest_path = root / "manifest.json"
+            manifest = {
+                "bundle": {"version": 1},
+                "documents": [
+                    {
+                        "id": "manuals/sample.md",
+                        "path": "official/sample.md",
+                        "collection": "manuals",
+                        "title": "SampleCommand",
+                        "bundle_sha256": hashlib.sha256(initial_bytes).hexdigest().upper(),
+                    }
+                ],
+            }
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+            try:
+                with patch.object(knowledge, "_KNOWLEDGE_DIR", root):
+                    first = knowledge.search("InitialAlphaToken", collection="manuals")
+                    self.assertEqual(first["results_count"], 1)
+                    index = knowledge._get_index()
+                    self.assertEqual(index.stats_misses, 1)
+                    self.assertEqual(index.stats_hits, 0)
+
+                    with patch.object(Path, "read_bytes", side_effect=AssertionError("unexpected disk read")):
+                        second = knowledge.search("InitialAlphaToken", collection="manuals")
+                        page = knowledge.read_document("manuals/sample.md")
+                    self.assertEqual(second["results_count"], 1)
+                    self.assertIn("InitialAlphaToken", page["content"])
+                    self.assertGreaterEqual(index.stats_hits, 2)
+                    self.assertEqual(index.stats_misses, 1)
+
+                    updated_bytes = b"# SampleCommand\nUpdatedBetaToken documentation with extra detail.\n"
+                    doc_path.write_bytes(updated_bytes)
+                    manifest["documents"][0]["bundle_sha256"] = hashlib.sha256(updated_bytes).hexdigest().upper()
+                    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+                    bumped = os.stat(manifest_path).st_mtime + 2.0
+                    os.utime(doc_path, (bumped, bumped))
+                    os.utime(manifest_path, (bumped, bumped))
+
+                    after_manifest_update = knowledge.search("UpdatedBetaToken", collection="manuals")
+                    self.assertEqual(after_manifest_update["results_count"], 1)
+                    self.assertEqual(
+                        knowledge.search("InitialAlphaToken", collection="manuals")["results_count"],
+                        0,
+                    )
+
+                    manifest["documents"][0].pop("bundle_sha256")
+                    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+                    bumped += 2.0
+                    os.utime(manifest_path, (bumped, bumped))
+                    self.assertEqual(
+                        knowledge.search("UpdatedBetaToken", collection="manuals")["results_count"],
+                        1,
+                    )
+
+                    third_bytes = b"# SampleCommand\nFreshGammaToken in-place update without manifest touch.\n"
+                    doc_path.write_bytes(third_bytes)
+                    bumped += 2.0
+                    os.utime(doc_path, (bumped, bumped))
+                    after_file_only_update = knowledge.search("FreshGammaToken", collection="manuals")
+                    self.assertEqual(after_file_only_update["results_count"], 1)
+                    self.assertIn("FreshGammaToken", knowledge.read_document("manuals/sample.md")["content"])
+            finally:
+                knowledge.clear_cache()
 
 
 if __name__ == "__main__":

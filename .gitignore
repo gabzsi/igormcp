@@ -26,7 +26,7 @@ Desktop.ini
 # Per-user Claude Code overrides
 .claude/settings.local.json
 
-# Local Igor call logs and session summaries
+# Local Igor call logs, session summaries, and setup outputs
 /sessions/
 /.local/
 

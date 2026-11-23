@@ -19,7 +19,8 @@ Major scientific publishers (Nature Portfolio, ACS, APS, Elsevier, Wiley) requir
 
 | Layout Target | Width (Inches) | Width (mm) | Igor Width (`pt`) | Default Aspect | Igor Height (`pt`) |
 |---|---|---|---|---|---|
-| **Single Column (1 col)** | 3.33 in | 85 mm | `width=240` | 4:3 or Square | `height=180` to `240` |
+| **ACS Single Column (1 col)** | 3.25 in | 82.5 mm | `width=234` | 4:3 or Square | `height=175` to `234` |
+| **Single Column (Nature / APS / 85 mm)** | 3.33 in | 85 mm | `width=240` | 4:3 or Square | `height=180` to `240` |
 | **Intermediate (1.5 col)**| 5.00 in | 127 mm| `width=360` | 16:10 | `height=225` |
 | **Double Column (2 col)** | 7.00 in | 178 mm| `width=504` | 16:9 or 2:1 | `height=280` to `350` |
 
@@ -38,14 +39,14 @@ Raw Igor graphs lack mirrored axes and have tight point clipping. A publication-
 
 ```text
 // Universal journal styling chain:
-ModifyGraph mirror=1, standoff=1, tick=0, axThick=1.0; ModifyGraph font="Arial", fSize=10; ModifyGraph lblMargin(left)=5, lblMargin(bottom)=5
+ModifyGraph mirror=1, standoff=1, tick=2, axThick=1.0; ModifyGraph font="Arial", fSize=10; ModifyGraph lblMargin(left)=5, lblMargin(bottom)=5
 ```
 
 | Flag | Recommended Setting | Purpose |
 |---|---|---|
 | **`mirror=1`** | `mirror=1` | Mirrors axes and ticks on top and right borders (box frame). |
 | **`standoff=1`** | `standoff=1` | Prevents edge data points from touching axis frame borders. |
-| **`tick=0`** | `tick=0` (inward) | Inward-facing tick marks (standard for physical sciences). `tick=1` is outward. |
+| **`tick=2`** | `tick=2` (inside) | Inward-facing tick marks (standard for physical sciences). `tick=0` is outside, `tick=1` is crossing, `tick=3` is none. |
 | **`axThick=1.0`** | `1.0` to `1.2` pt | Line width of axis lines and tick marks. |
 | **`font="Arial"`** | `"Arial"` / `"Helvetica"` | Standard clean sans-serif font accepted by all journals. |
 | **`fSize=10`** | `9` to `11` pt | Legible tick and axis label text size when scaled in print. |

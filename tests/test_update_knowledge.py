@@ -132,7 +132,7 @@ class BundleUpdateTests(unittest.TestCase):
         index = f"# Igor Pro\n## Basics\n- [Waves]({page_url}): waves.\n".encode()
         source = b"# Waves\n![figure](./waves.png)\n"
         old_manifest = json.loads((Path(updater.__file__).resolve().parents[1] / "knowledge" / "manifest.json").read_text())
-        expected_guides = {item["id"]: item["path"] for item in old_manifest["documents"]}
+        expected_guides = {item["id"]: item["path"] for item in old_manifest["documents"] if item["collection"] == "guides"}
 
         def fake_fetch(url, _limit):
             return index if url == updater.INDEX_URL else source

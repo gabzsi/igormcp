@@ -1,24 +1,22 @@
-# Repository instructions
+# Igor Pro MCP project instructions
 
-This project is a standalone Windows MCP server for Igor Pro. The server communicates with its MCP host over stdio; a wiki, a Git history, and the optional agent skill are not runtime requirements.
+This is a standalone Windows MCP server for Igor Pro. Bundled Markdown knowledge and local session memory are runtime data; no wiki or Git history is required to run the server.
 
-## Server and integrations
+## Igor tasks
 
-- Core runtime: `igor_mcp_server.py`, `igor_knowledge.py`, `igor_sessions.py`, and the `knowledge/` package.
-- Optional agent integration: `.agents/skills/igor-pro/SKILL.md` supplies extra task guidance to compatible agents. It is not required to install or run the MCP server. Host configuration is separate and must be added by the user; setup templates do not edit host settings.
-- Public knowledge includes the project-authored curated guides. Official WaveMetrics manuals are not included; do not add locally installed manual exports or their images without redistribution permission.
+- Route Igor operations through the `igor-pro` MCP server. Start or attach through `ensure_igor`; never launch Igor from a shell.
+- Prefer direct `execute_igor` commands for simple calculations, plots, fitting, inspection, and short command sequences. Use an IPF procedure for ODE simulations, instrument control, batch or loop-heavy processing across multiple datasets, reusable routines, or an explicit user request. Data size alone does not call for an IPF when a built-in command handles the work simply.
+- For elementary tasks, use the initialize guidance and current Igor context directly; do not enumerate or pre-read basic-reference pages. Use local MCP knowledge tools for uncertain syntax, unfamiliar operations, or unresolved diagnostics. Never use web search, a browser, HTTP fetch, or external sites to look up Igor documentation. If local knowledge lacks needed details, report the gap and ask the user. The installer/updater download is a separate installation workflow, not task-time lookup. Search session memory only for nontrivial workflows being repeated or relevant workarounds, not elementary one-offs.
+- Preserve the user-chosen window state; do not force Igor into the foreground or minimize it automatically. Review command results and diagnostics before retrying. Inspect remaining dialogs with `get_igor_dialogs` or `get_igor_compilation_errors`; use explicit dismissal tools only when appropriate.
 
-## Igor work and safety
+## Session memory
 
-- Route live Igor work through a connected `igor-pro` MCP server. Use `ensure_igor` to attach or start; never launch Igor from a shell.
-- Prefer direct `execute_igor` commands for simple one-off work. Use IPF procedures for ODEs, instrument control, repeated loops, substantial multi-dataset work, or reusable routines.
-- For elementary work, use the supplied initialize guidance and current Igor context directly. Do not enumerate or pre-read basic-reference pages as a preflight; use local MCP knowledge tools for uncertain syntax, unfamiliar operations, or unresolved diagnostics. Never use web search, a browser, HTTP fetch, forums, or any external source to look up Igor commands, examples, errors, or documentation. If local knowledge lacks needed details, report the gap and ask the user. Run installer/updater downloads only for explicitly requested installation or refresh, never as task-time lookup. Search session memory only for nontrivial workflows being repeated or relevant workarounds, not elementary one-offs.
-- Preserve experiment data. Use fresh folders and names; do not use overwrite flags unless explicitly requested.
-- Review command results and diagnostics before retrying. A timeout can leave the outcome unknown. Inspect dialogs or compiler errors before using a dismissal tool.
-- Do not create live Igor calls as part of ordinary tests. If a live test is explicitly requested, bound writes to a uniquely named data folder.
+- MCP tool calls are written automatically as bounded JSONL logs under `sessions/`.
+- Use `capture_session` to write a concise Markdown summary when a result, preference, or workaround is likely to help future work. The automatic log is call history; a summary records the useful outcome.
+- Source host configurations set `IGOR_SESSION_DIR` to this repository's `sessions/`. Installed deployments default to `%LOCALAPPDATA%\igor-mcp\sessions`.
+- Session files are local, Git-ignored, and never committed automatically. Do not create wiki pages or development reports unless the user asks.
 
-## Development and local data
+## Server changes
 
-- Use Python 3.10 or newer. After setup, run the offline suite with `.venv\Scripts\python.exe -B -m unittest discover -s tests` from the repository root.
-- Session memory is local runtime data. Bounded tool-call JSONL logs are automatic; `capture_session` writes a separate summary only when useful. Keep `sessions/`, `.local/`, virtual environments, credentials, logs, and generated artifacts out of commits.
-- `IGOR_KNOWLEDGE_DIR` may point to an existing authorized knowledge bundle with a compatible `manifest.json`; this project does not import native Igor help files.
+- Run offline tests with `.venv\Scripts\python.exe -B -m unittest discover -s tests`.
+- Preserve Igor experiment data and unrelated changes. Bound any requested live test to a uniquely named data folder.

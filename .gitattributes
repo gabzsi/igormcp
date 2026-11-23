@@ -1,0 +1,2 @@
+# Keep curated knowledge guides on LF so SHA-256 manifest hashes match across Windows and Linux CI
+knowledge/curated/*.md text eol=lf
